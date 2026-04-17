@@ -1,0 +1,137 @@
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "api": {
+    "tag": "api",
+    "services": [
+      "StatsService"
+    ]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    }
+  },
+  "inbounds": [
+    {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    },
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": $LISTEN_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": $CLIENTS,
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": $REALITY_DEST,
+          "xver": 0,
+          "serverNames": [
+            $SERVER_NAME
+          ],
+          "privateKey": $REALITY_PRIVATE_KEY,
+          "shortIds": [
+            $SHORT_ID
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    },
+    {
+      "tag": "ss-freedom",
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [
+          {
+            "address": $OUTLINE_ADDRESS,
+            "port": $OUTLINE_PORT,
+            "method": $OUTLINE_METHOD,
+            "password": $OUTLINE_PASSWORD
+          }
+        ]
+      }
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api"
+      },
+      {
+        "type": "field",
+        "domain": $CORPORATE_DOMAINS,
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": $CORPORATE_IPS,
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-ru"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "geoip:ru"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "0.0.0.0/0",
+          "::/0"
+        ],
+        "outboundTag": "ss-freedom"
+      }
+    ]
+  }
+}

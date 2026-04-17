@@ -1,0 +1,20 @@
+# Corporate route list consumed by both OpenVPN (split-tunnel) and Xray routing.
+# One `route <network> <netmask>` per line. Blank lines and `#` comments are ignored.
+#
+# Rule of thumb: list every subnet or host that must exit via the corporate tunnel.
+# Anything not listed here will NOT be pulled into tun0 and will go out via the
+# default outbound (see routing config).
+
+# Ignore anything the server pushes (routes, DNS, gateway) - we use the list below instead.
+route-nopull
+
+# VPN subnet itself (adjust to match your OpenVPN server's tunnel network)
+route 10.8.0.0 255.255.255.0
+
+# Corporate private subnets (replace with your own)
+# route 10.0.0.0   255.255.0.0
+# route 10.1.0.0   255.255.0.0
+
+# Specific public hosts that live behind the corporate perimeter
+# route 203.0.113.10   255.255.255.255
+# route 203.0.113.11   255.255.255.255

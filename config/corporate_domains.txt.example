@@ -1,0 +1,9 @@
+# Domains (and subdomains) that must always exit via the corporate OpenVPN tunnel.
+# Blank lines and lines starting with # are ignored.
+# Syntax matches Xray routing (see https://xtls.github.io/config/routing.html):
+#   domain:example.com   - example.com and all subdomains
+#   full:host.example    - only that exact host
+#   keyword:example      - any domain containing "example"
+#   regexp:^api\..*      - regex match
+
+domain:example.com
