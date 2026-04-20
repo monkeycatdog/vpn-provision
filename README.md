@@ -93,7 +93,7 @@ What it does (all on the remote VPS, driven from your laptop):
 5. Rewrites the `.ovpn` for split-tunnel, starts `openvpn-client@corporate`, waits for `tun0`, and verifies at least one corporate route from `config/ips.txt` is installed on `tun0`.
 6. Generates (or reuses) the REALITY keypair and a `short_id`.
 7. Renders `config/xray_config.template.json` with your clients + keys + Outline + corp IPs.
-8. Validates the rendered Xray config remotely and starts the container.
+8. Validates the rendered Xray config remotely, downloads Loyalsoldier `geoip.dat` / `geosite.dat` into `${INSTALL_DIR}/xray/assets/`, installs the **daily geo refresh** systemd timer, and starts the container.
 9. Writes `state/<host>/{node.json,clients.json,connection.txt}` locally.
 10. Prints the bootstrap VLESS URI.
 
@@ -143,7 +143,7 @@ This repository provisions and manages a VPS that accepts a single **VLESS + REA
 | Path | Mechanism | Exit |
 |------|-----------|------|
 | Corporate | `direct` in Xray; kernel routes using host routes from OpenVPN on `tun0` | Corporate network via OpenVPN |
-| Russian domestic | `direct`; matches `geoip:ru` and `geosite:category-ru` | VPS native public interface |
+| Russian domestic | `direct`; matches `geoip:ru` and many `geosite:*` / `domain:` rules (see [config/xray_config.template.json](config/xray_config.template.json)), resolved using **Loyalsoldier** [v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) `geoip.dat` / `geosite.dat` on the VPS | VPS native public interface |
 | Everything else | Shadowsocks outbound to the configured Outline node | Freedom Outline relay |
 
 **Control model:** config-as-code. Local scripts under `scripts/` render config, upload assets, and keep state under `state/<host>/`. Run CLI examples from the **repository root** so paths like `./scripts/...` and `config/...` resolve correctly.
@@ -172,6 +172,33 @@ flowchart LR
   X -->|"default"| MO
 ```
 
+### Geo databases and refresh (architecture)
+
+Xray does not embed routing lists in `config.json`. It loads binary **`geoip.dat`** and **`geosite.dat`** from the asset directory (`XRAY_LOCATION_ASSET`, mounted read-only into the container). This stack uses the **Loyalsoldier** builds of those files so tags like `geosite:category-ru`, `geosite:category-bank-ru`, and `geoip:ru` resolve consistently with the upstream project.
+
+```mermaid
+flowchart LR
+  subgraph upstream["Upstream"]
+    LS["Loyalsoldier\nv2ray-rules-dat"]
+  end
+  subgraph vps["VPS host"]
+    A["install_dir/xray/assets/\ngeosite.dat + geoip.dat"]
+    J["systemd timer\nupdate-geo-assets.sh\ndaily"]
+    D["deploy-config\ninitial download"]
+  end
+  subgraph container["Container"]
+    X["tristate-xray\n/usr/local/share/xray"]
+  end
+  LS -->|"HTTPS curl"| D
+  LS -->|"HTTPS curl"| J
+  D --> A
+  J --> A
+  A -->|"bind mount"| X
+```
+
+- **On every deploy** (`remote_apply_node.sh deploy-config`, invoked by provision and `manage_inbound.sh`): assets are downloaded into `${INSTALL_DIR}/xray/assets/`, Docker Compose is applied, and Xray is restarted.
+- **Between deploys**: **`tristate-xray-geo-update.timer`** runs **`${INSTALL_DIR}/xray/update-geo-assets.sh`** once per day (with a randomized delay). The script re-downloads both files, replaces them only if the content changed, and restarts the Xray container when an update was applied.
+
 **Why `direct` can mean two different exits**
 
 - Xray runs with host networking; the kernel picks the interface for each `direct` packet.
@@ -181,8 +208,10 @@ flowchart LR
 Routing order inside Xray matches destinations in this order:
 
 1. Corporate IPs from [config/ips.txt](config/ips.txt) → `direct`
-2. `geoip:ru` and `geosite:category-ru` → `direct`
+2. Russian domestic: the `domain` list in the template (including `geosite:…` and `domain:…` entries) and the separate `geoip:ru` rule → `direct`
 3. Everything else → `ss-freedom` (Outline)
+
+Editing [config/xray_config.template.json](config/xray_config.template.json) changes which names match before IP routing; the **`.dat`** files must contain the referenced `geosite:` / `geoip:` tags (Loyalsoldier’s lists include the `category-*-ru` and vendor lists used there).
 
 ---
 
@@ -191,6 +220,7 @@ Routing order inside Xray matches destinations in this order:
 ### On your laptop
 
 - `bash`, `ssh`, `scp`, `python3`
+- `curl` (required for `provision_remote.sh --dry-run` when it runs local `xray run -test` with the same Loyalsoldier assets as production)
 - SSH access to the target VPS
 - [`just`](https://github.com/casey/just) (optional): command runner for recipes that read [.env.example](.env.example)
 
@@ -199,6 +229,7 @@ Routing order inside Xray matches destinations in this order:
 - Ubuntu 22.04 or 24.04
 - A public IP address
 - `sudo` for the SSH user if you do not connect as `root`
+- Outbound HTTPS to fetch `geoip.dat` / `geosite.dat` (GitHub releases); `curl` is installed during bootstrap alongside Docker and the rest of the stack
 
 ### Inputs before provisioning
 
@@ -242,7 +273,7 @@ Routing order inside Xray matches destinations in this order:
 | Artifact | Role |
 |----------|------|
 | [scripts/provision_remote.sh](scripts/provision_remote.sh) | Local entry point: uploads assets, bootstraps the VPS, renders config, deploys Xray, writes local state |
-| [scripts/remote_apply_node.sh](scripts/remote_apply_node.sh) | Remote helper: packages, UFW, OpenVPN, REALITY keys, Xray validation, containers |
+| [scripts/remote_apply_node.sh](scripts/remote_apply_node.sh) | Remote helper: packages, UFW, OpenVPN, REALITY keys, Loyalsoldier geo assets, systemd geo-update timer, Xray validation, containers |
 | [scripts/manage_inbound.sh](scripts/manage_inbound.sh) | Add/remove/rotate VLESS clients; optional inbound port change |
 | [scripts/diagnose_relay.sh](scripts/diagnose_relay.sh) | Read-only health check: Outline reachability, Xray container state, recent logs |
 | [scripts/trace_routing.sh](scripts/trace_routing.sh) | Per-domain routing trace: local prediction + kernel route + Xray access-log grep |
@@ -431,7 +462,7 @@ Change the inbound listen port:
 ./scripts/manage_inbound.sh --state-dir ./state/YOUR_VPS_IP set-port 8443
 ```
 
-Behavior: `scripts/manage_inbound.sh` updates local state, re-renders `rendered-config.json`, uploads to the VPS, validates remotely, and restarts the Xray container via Docker Compose.
+Behavior: `scripts/manage_inbound.sh` updates local state, re-renders `rendered-config.json`, uploads to the VPS, validates remotely, and runs `remote_apply_node.sh deploy-config` (refreshes geo `.dat` files if needed, reapplies Compose, ensures the geo-update timer exists, restarts Xray).
 
 ### Reprovision an existing node
 
@@ -480,6 +511,21 @@ Install directory:
 ```bash
 ssh root@YOUR_VPS_IP 'sudo ls -R /opt/tristate-relay'
 ```
+
+Loyalsoldier geo refresh timer (daily):
+
+```bash
+ssh root@YOUR_VPS_IP 'systemctl status tristate-xray-geo-update.timer --no-pager'
+ssh root@YOUR_VPS_IP 'systemctl list-timers | grep tristate-xray-geo || true'
+```
+
+Manual geo update (same script the timer runs):
+
+```bash
+ssh root@YOUR_VPS_IP 'sudo /opt/tristate-relay/xray/update-geo-assets.sh'
+```
+
+Use your real `${INSTALL_DIR}` from `state/<host>/node.json` if it is not `/opt/tristate-relay`.
 
 ### Routing trace and diagnose
 
@@ -560,7 +606,7 @@ Everything runs inside one SSH session so sshd `MaxStartups` rate-limits do not 
 
 **Russian destinations do not stay on the native Russian IP**
 
-- Confirm the destination matches `geoip:ru` / `geosite:category-ru`
+- Confirm the hostname is covered by the `domain` / `geosite` rules in [config/xray_config.template.json](config/xray_config.template.json) or by `geoip:ru` after resolution, and that `${INSTALL_DIR}/xray/assets/*.dat` are present and recent (deploy and the daily timer both refresh them)
 - Confirm no corporate route in [config/ips.txt](config/ips.txt) overrides that traffic
 
 **Reprovision and clients**

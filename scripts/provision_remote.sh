@@ -5,6 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_DIR="${REPO_ROOT}/config"
+XRAY_IMAGE="ghcr.io/xtls/xray-core:latest@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7"
+LOYALSOLDIER_GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+LOYALSOLDIER_GEOIP_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 
 usage() {
   cat <<'EOF'
@@ -131,6 +134,9 @@ fi
 for cmd in ssh scp python3; do
   require_cmd "${cmd}"
 done
+if [[ "${DRY_RUN}" == "1" ]]; then
+  require_cmd curl
+fi
 
 for file in "${CORP_OVPN}" "${CONFIG_DIR}/ips.txt" "${SCRIPT_DIR}/remote_apply_node.sh" "${CONFIG_DIR}/xray_config.template.json"; do
   if [[ ! -f "${file}" ]]; then
@@ -249,7 +255,7 @@ PY
   dry_private=""
   dry_public=""
   if command -v docker >/dev/null 2>&1; then
-    dry_keys="$(docker run --rm --entrypoint xray ghcr.io/xtls/xray-core:latest@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7 x25519 2>/dev/null || true)"
+    dry_keys="$(docker run --rm --entrypoint xray "${XRAY_IMAGE}" x25519 2>/dev/null || true)"
     dry_private="$(printf '%s\n' "${dry_keys}" | awk '/^PrivateKey:/ {print $2; exit} /^Private key:/ {print $3; exit}')"
     dry_public="$(printf '%s\n' "${dry_keys}" | awk '/Password \(PublicKey\):/ {print $NF; exit} /^Public key:/ {print $3; exit}')"
   fi
@@ -346,9 +352,14 @@ PY
       echo "[dry-run] Skipping 'xray run -test' (no valid x25519 keys from docker)."
     else
       echo "[dry-run] Running 'xray run -test' locally via docker"
+      mkdir -p "${tmp_dir}/xray-assets"
+      curl -fsSL "${LOYALSOLDIER_GEOSITE_URL}" -o "${tmp_dir}/xray-assets/geosite.dat"
+      curl -fsSL "${LOYALSOLDIER_GEOIP_URL}" -o "${tmp_dir}/xray-assets/geoip.dat"
       if docker run --rm --entrypoint xray \
+        -e XRAY_LOCATION_ASSET=/usr/local/share/xray \
         -v "${tmp_dir}/rendered.json:/etc/xray/config.json:ro" \
-        ghcr.io/xtls/xray-core:latest@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7 \
+        -v "${tmp_dir}/xray-assets:/usr/local/share/xray:ro" \
+        "${XRAY_IMAGE}" \
         run -test -config /etc/xray/config.json &>"${tmp_dir}/xray.out"; then
         echo "  xray run -test: PASS"
       else

@@ -3,6 +3,80 @@
 set -euo pipefail
 
 IMAGE="ghcr.io/xtls/xray-core:latest@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7"
+LOYALSOLDIER_GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+LOYALSOLDIER_GEOIP_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+
+download_loyalsoldier_geo_assets() {
+  local dest="$1"
+  install -d -m 0755 "${dest}"
+  curl -fsSL "${LOYALSOLDIER_GEOSITE_URL}" -o "${dest}/geosite.dat"
+  curl -fsSL "${LOYALSOLDIER_GEOIP_URL}" -o "${dest}/geoip.dat"
+}
+
+install_geo_update_job() {
+  local install_dir="$1"
+  local script_path="${install_dir}/xray/update-geo-assets.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo "INSTALL_DIR='${install_dir}'"
+    echo "LOYALSOLDIER_GEOSITE_URL='${LOYALSOLDIER_GEOSITE_URL}'"
+    echo "LOYALSOLDIER_GEOIP_URL='${LOYALSOLDIER_GEOIP_URL}'"
+    echo 'COMPOSE="${INSTALL_DIR}/docker-compose.yml"'
+    cat <<'INNER'
+ASSETS="${INSTALL_DIR}/xray/assets"
+install -d -m 0755 "${ASSETS}"
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+curl -fsSL "${LOYALSOLDIER_GEOSITE_URL}" -o "${tmp}/geosite.dat.new"
+curl -fsSL "${LOYALSOLDIER_GEOIP_URL}" -o "${tmp}/geoip.dat.new"
+changed=0
+if [[ ! -f "${ASSETS}/geosite.dat" ]] || ! cmp -s "${tmp}/geosite.dat.new" "${ASSETS}/geosite.dat"; then
+  mv "${tmp}/geosite.dat.new" "${ASSETS}/geosite.dat"
+  changed=1
+else
+  rm -f "${tmp}/geosite.dat.new"
+fi
+if [[ ! -f "${ASSETS}/geoip.dat" ]] || ! cmp -s "${tmp}/geoip.dat.new" "${ASSETS}/geoip.dat"; then
+  mv "${tmp}/geoip.dat.new" "${ASSETS}/geoip.dat"
+  changed=1
+else
+  rm -f "${tmp}/geoip.dat.new"
+fi
+if [[ "${changed}" -eq 1 ]] && [[ -f "${COMPOSE}" ]]; then
+  docker compose -f "${COMPOSE}" restart xray >&2 || echo "tristate-xray-geo-update: geo files updated but docker restart failed" >&2
+fi
+INNER
+  } >"${script_path}"
+  chmod 0755 "${script_path}"
+
+  cat >/etc/systemd/system/tristate-xray-geo-update.service <<EOF
+[Unit]
+Description=Update Loyalsoldier geo data for tristate Xray
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${script_path}
+EOF
+
+  cat >/etc/systemd/system/tristate-xray-geo-update.timer <<'EOF'
+[Unit]
+Description=Daily refresh of Loyalsoldier geoip/geosite for tristate Xray
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >&2
+  systemctl enable --now tristate-xray-geo-update.timer >&2
+}
 
 usage() {
   cat <<'EOF'
@@ -49,9 +123,15 @@ bootstrap() {
   apt-get install -y software-properties-common >&2
   add-apt-repository -y universe >&2 || true
   apt-get update >&2
-  apt-get install -y ca-certificates curl docker-compose-plugin docker.io jq openvpn python3 ufw >&2 || {
-    echo "apt install docker-compose-plugin failed; installing docker.io and Compose v2 plugin from GitHub" >&2
-    apt-get install -y ca-certificates curl docker.io jq openvpn python3 ufw >&2
+  apt-get install -y ca-certificates curl docker.io jq openvpn python3 ufw >&2
+  use_compose_github=0
+  if ! apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+    use_compose_github=1
+  elif ! apt-get install -y docker-compose-plugin >&2; then
+    use_compose_github=1
+  fi
+  if [[ "${use_compose_github}" -eq 1 ]]; then
+    echo "docker-compose-plugin not available from apt (or install failed); installing Docker Compose v2 CLI plugin from GitHub" >&2
     arch="$(uname -m)"
     case "${arch}" in
       x86_64) dc_arch="x86_64" ;;
@@ -62,7 +142,7 @@ bootstrap() {
     curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-${dc_arch}" \
       -o /usr/local/lib/docker/cli-plugins/docker-compose
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-  }
+  fi
   systemctl enable --now docker >&2
 
   cat >/etc/sysctl.d/99-tristate-relay.conf <<'EOF'
@@ -296,6 +376,8 @@ deploy_config() {
 
   install -d -m 0755 "${install_dir}/xray"
   install -d -m 0777 "${install_dir}/xray/logs"
+  echo "[deploy-config] downloading Loyalsoldier geoip.dat / geosite.dat" >&2
+  download_loyalsoldier_geo_assets "${install_dir}/xray/assets"
 
   local previous_port=""
   if [[ -f "${install_dir}/xray/config.json" ]]; then
@@ -331,11 +413,13 @@ else:
     raise SystemExit("vless-reality-in inbound not found in config")
 PY
 )"
+  echo "[deploy-config] ufw allow ${listen_port}/tcp" >&2
   ufw allow "${listen_port}/tcp" >&2
   if [[ -n "${previous_port}" && "${previous_port}" != "${listen_port}" ]]; then
     ufw delete allow "${previous_port}/tcp" >&2 || true
   fi
 
+  echo "[deploy-config] writing docker-compose.yml" >&2
   cat >"${install_dir}/docker-compose.yml" <<EOF
 services:
   xray:
@@ -345,9 +429,12 @@ services:
     network_mode: host
     user: "0:0"
     command: ["run", "-config", "/etc/xray/config.json"]
+    environment:
+      XRAY_LOCATION_ASSET: /usr/local/share/xray
     volumes:
       - ${install_dir}/xray/config.json:/etc/xray/config.json:ro
       - ${install_dir}/xray/logs:/var/log/xray
+      - ${install_dir}/xray/assets:/usr/local/share/xray:ro
     healthcheck:
       test: ["CMD", "xray", "run", "-test", "-config", "/etc/xray/config.json"]
       interval: 30s
@@ -355,17 +442,33 @@ services:
       retries: 3
 EOF
 
+  echo "[deploy-config] xray run -test (config + geo assets)" >&2
+  xray_test_rc=0
   docker run --rm --entrypoint xray \
+    -e XRAY_LOCATION_ASSET=/usr/local/share/xray \
     -v "${install_dir}/xray/config.json:/etc/xray/config.json:ro" \
-    "${IMAGE}" run -test -config /etc/xray/config.json >/dev/null
+    -v "${install_dir}/xray/assets:/usr/local/share/xray:ro" \
+    "${IMAGE}" run -test -config /etc/xray/config.json || xray_test_rc=$?
+  if [[ "${xray_test_rc}" -ne 0 ]]; then
+    echo "[deploy-config] ERROR: xray run -test failed (exit ${xray_test_rc})" >&2
+    exit 1
+  fi
 
-  docker compose -f "${install_dir}/docker-compose.yml" pull >&2
+  echo "[deploy-config] docker pull Xray image" >&2
+  docker pull "${IMAGE}" >&2
+
+  echo "[deploy-config] docker compose up -d" >&2
   docker compose -f "${install_dir}/docker-compose.yml" up -d >&2
   # Xray reads config only at startup; the config.json bind-mount content may
   # have changed even when docker compose sees no image/compose change, so
   # force a restart so the new routing rules take effect.
+  echo "[deploy-config] docker compose restart xray" >&2
   docker compose -f "${install_dir}/docker-compose.yml" restart xray >&2
 
+  echo "[deploy-config] install systemd geo refresh timer" >&2
+  install_geo_update_job "${install_dir}"
+
+  echo "[deploy-config] done" >&2
   docker ps --filter name=tristate-xray --format '{{.Names}} {{.Status}}'
 }
 
