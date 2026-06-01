@@ -5,3 +5,16 @@ state/
 config/corporate_domains.txt
 config/ips.txt
 !config/*.example
+local-rig/mihomo/cert/
+local-rig/mihomo/cache.db
+local-rig/mihomo/*.db
+local-rig/mihomo/geoip.dat
+local-rig/mihomo/geosite.dat
+local-rig/openvpn-corp/
+
+# python cache
+__pycache__/
+.pytest_cache/
+
+# claude code worktrees / local agent state
+.claude/

@@ -9,21 +9,20 @@ provision:
   cd "{{justfile_directory()}}"
   : "${TRISTATE_HOST:?set TRISTATE_HOST in .env}"
   : "${TRISTATE_CORP_OVPN:?set TRISTATE_CORP_OVPN in .env}"
-  : "${TRISTATE_OUTLINE_URI:?set TRISTATE_OUTLINE_URI in .env}"
+  : "${TRISTATE_OUTLINE_URIS:?set TRISTATE_OUTLINE_URIS (comma-separated) in .env}"
   cmd=(
     ./scripts/provision_remote.sh
     --host "$TRISTATE_HOST"
     --user "${TRISTATE_SSH_USER:-root}"
     --corp-ovpn "$TRISTATE_CORP_OVPN"
-    --outline-uri "$TRISTATE_OUTLINE_URI"
     --ssh-port "${TRISTATE_SSH_PORT:-22}"
     --listen-port "${TRISTATE_LISTEN_PORT:-443}"
-    --server-name "${TRISTATE_SERVER_NAME:-yandex.ru}"
-    --reality-dest "${TRISTATE_REALITY_DEST:-yandex.ru:443}"
-    --client-name "${TRISTATE_CLIENT_NAME:-laptop}"
     --install-dir "${TRISTATE_INSTALL_DIR:-/opt/tristate-relay}"
     --state-root "${TRISTATE_STATE_ROOT:-./state}"
   )
+  IFS=',' read -ra _uris <<< "$TRISTATE_OUTLINE_URIS"
+  for u in "${_uris[@]}"; do cmd+=(--outline-uri "$u"); done
+  [[ -n "${TRISTATE_CLIENT_NAME:-}" ]] && cmd+=(--client-name "$TRISTATE_CLIENT_NAME")
   [[ -n "${TRISTATE_SSH_IDENTITY:-}" ]] && cmd+=(--ssh-identity "$TRISTATE_SSH_IDENTITY")
   [[ -n "${TRISTATE_AUTH_FILE:-}" ]] && cmd+=(--auth-file "$TRISTATE_AUTH_FILE")
   "${cmd[@]}"
@@ -34,22 +33,21 @@ provision-check:
   cd "{{justfile_directory()}}"
   : "${TRISTATE_HOST:?set TRISTATE_HOST in .env}"
   : "${TRISTATE_CORP_OVPN:?set TRISTATE_CORP_OVPN in .env}"
-  : "${TRISTATE_OUTLINE_URI:?set TRISTATE_OUTLINE_URI in .env}"
+  : "${TRISTATE_OUTLINE_URIS:?set TRISTATE_OUTLINE_URIS (comma-separated) in .env}"
   cmd=(
     ./scripts/provision_remote.sh
     --host "$TRISTATE_HOST"
     --user "${TRISTATE_SSH_USER:-root}"
     --corp-ovpn "$TRISTATE_CORP_OVPN"
-    --outline-uri "$TRISTATE_OUTLINE_URI"
     --ssh-port "${TRISTATE_SSH_PORT:-22}"
     --listen-port "${TRISTATE_LISTEN_PORT:-443}"
-    --server-name "${TRISTATE_SERVER_NAME:-yandex.ru}"
-    --reality-dest "${TRISTATE_REALITY_DEST:-yandex.ru:443}"
-    --client-name "${TRISTATE_CLIENT_NAME:-laptop}"
     --install-dir "${TRISTATE_INSTALL_DIR:-/opt/tristate-relay}"
     --state-root "${TRISTATE_STATE_ROOT:-./state}"
     --dry-run
   )
+  IFS=',' read -ra _uris <<< "$TRISTATE_OUTLINE_URIS"
+  for u in "${_uris[@]}"; do cmd+=(--outline-uri "$u"); done
+  [[ -n "${TRISTATE_CLIENT_NAME:-}" ]] && cmd+=(--client-name "$TRISTATE_CLIENT_NAME")
   [[ -n "${TRISTATE_SSH_IDENTITY:-}" ]] && cmd+=(--ssh-identity "$TRISTATE_SSH_IDENTITY")
   [[ -n "${TRISTATE_AUTH_FILE:-}" ]] && cmd+=(--auth-file "$TRISTATE_AUTH_FILE")
   "${cmd[@]}"
@@ -94,14 +92,18 @@ manage-rotate name:
   [[ "${TRISTATE_DRY_RUN:-0}" == "1" ]] && cmd+=(--dry-run)
   "${cmd[@]}" rotate-client "{{name}}"
 
-manage-uri name:
+manage-config name:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "{{justfile_directory()}}"
   sd="$(./scripts/tristate_state_dir.sh)"
   cmd=(./scripts/manage_inbound.sh --state-dir "$sd")
   [[ -n "${TRISTATE_SSH_IDENTITY:-}" ]] && cmd+=(--ssh-identity "$TRISTATE_SSH_IDENTITY")
-  "${cmd[@]}" print-uri "{{name}}"
+  "${cmd[@]}" print-config "{{name}}"
+
+manage-uri name:
+  @echo "warning: 'just manage-uri' is deprecated; use 'just manage-config'" >&2
+  @just manage-config "{{name}}"
 
 manage-set-port port:
   #!/usr/bin/env bash
@@ -118,7 +120,7 @@ connection:
   set -euo pipefail
   cd "{{justfile_directory()}}"
   sd="$(./scripts/tristate_state_dir.sh)"
-  cat "$sd/connection.txt"
+  cat "$sd/connection.yaml"
 
 diagnose:
   #!/usr/bin/env bash

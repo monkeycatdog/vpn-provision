@@ -5,9 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_DIR="${REPO_ROOT}/config"
-XRAY_IMAGE="ghcr.io/xtls/xray-core:latest@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7"
-LOYALSOLDIER_GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-LOYALSOLDIER_GEOIP_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+SIDECAR_BUILD_DIR="${REPO_ROOT}/sidecar/openvpn-corp"
+MIHOMO_IMAGE="metacubex/mihomo:v1.19.25"
 
 usage() {
   cat <<'EOF'
@@ -16,25 +15,31 @@ Usage:
     --host relay.example.com \
     --user root \
     --corp-ovpn /path/to/corporate.ovpn \
-    --outline-uri 'ss://...' \
+    --outline-uri 'ss://...' [--outline-uri 'ss://...' ...] \
+    [--outline-uris-csv 'ss://a,ss://b'] \
     [--auth-file /path/to/auth.txt] \
     [--ssh-port 22] \
     [--listen-port 443] \
-    [--server-name yandex.ru] \
-    [--reality-dest yandex.ru:443] \
     [--client-name laptop] \
     [--dry-run]
 
 What it does:
   - connects from your laptop to the VPS over SSH
-  - installs Docker, OpenVPN, UFW, and the Xray relay stack
-  - hardens OpenVPN into split-tunnel mode using config/ips.txt
-  - generates a VLESS+REALITY inbound
-  - writes local state under ./state/<host> for future client/inbound management
+  - installs Docker, UFW, and the mihomo relay stack
+  - generates a self-signed EC P-256 cert/key pair locally for hysteria2 TLS
+    (pinned by SHA-256 fingerprint, so no SNI/CA infrastructure needed)
+  - builds an openvpn-corp sidecar container (real OpenVPN client) that holds
+    the corporate tunnel and exposes a loopback SOCKS5 proxy; mihomo routes
+    corp-destined traffic to it (mihomo itself never speaks OpenVPN, which lets
+    this work with legacy gateways: BF-CBC, no tls-crypt)
+  - encodes one or more Outline (ss://) endpoints as upstream proxies
+  - hardens routing using config/ips.txt and config/corporate_domains.txt
+  - writes local state under ./state/<host> for future client management
 
-  With --dry-run: validates env, files, Outline URI, OpenVPN deps, SSH
-  reachability, passwordless sudo, remote port availability, and renders
-  the Xray template locally with fake keys (xray run -test if docker is local).
+  With --dry-run: validates env, files, every Outline URI, OpenVPN parsing,
+  SSH reachability, passwordless sudo, remote port availability, and renders
+  the mihomo template locally with a placeholder cert. If docker is present
+  locally, runs `mihomo -t` against the rendered config as a smoke check.
   Makes zero changes on the VPS or in ./state/.
 EOF
 }
@@ -90,15 +95,279 @@ for raw_line in ovpn_path.read_text().splitlines():
 PY
 }
 
+# parse_ovpn <ovpn_path> <auth_file_or_empty> <output_json_path>
+# Parses an OpenVPN config into a JSON document suitable for node["openvpn_corp"].
+parse_ovpn() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import re
+import shlex
+import sys
+from pathlib import Path
+
+ovpn_path = Path(sys.argv[1])
+auth_path = sys.argv[2]
+output_path = sys.argv[3]
+
+text = ovpn_path.read_text()
+source_dir = ovpn_path.parent
+
+server = None
+port = None
+proto = "udp"
+cipher = None
+auth_digest = None
+
+# Extract simple directives line-by-line, ignoring lines inside inline blocks.
+inline_block = None
+inline_buffers = {}
+for raw_line in text.splitlines():
+    line = raw_line.rstrip()
+    stripped = line.strip()
+    if inline_block is not None:
+        if stripped == f"</{inline_block}>":
+            inline_block = None
+            continue
+        inline_buffers.setdefault(inline_block, []).append(raw_line)
+        continue
+    if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+        continue
+    m = re.match(r"<([a-zA-Z0-9_-]+)>$", stripped)
+    if m:
+        inline_block = m.group(1)
+        inline_buffers.setdefault(inline_block, [])
+        continue
+    try:
+        parts = shlex.split(stripped)
+    except ValueError:
+        continue
+    if not parts:
+        continue
+    key = parts[0]
+    if key == "remote" and len(parts) >= 2:
+        if server is None:
+            server = parts[1]
+            if len(parts) >= 3 and parts[2].isdigit():
+                port = int(parts[2])
+            if len(parts) >= 4 and parts[3] in ("udp", "tcp"):
+                proto = parts[3]
+    elif key == "port" and len(parts) >= 2 and parts[1].isdigit():
+        if port is None:
+            port = int(parts[1])
+    elif key == "proto" and len(parts) >= 2:
+        proto = parts[1]
+        if proto.startswith("tcp"):
+            proto = "tcp"
+        elif proto.startswith("udp"):
+            proto = "udp"
+    elif key in ("cipher", "data-ciphers"):
+        if len(parts) >= 2 and cipher is None:
+            cipher = parts[1].split(":")[0]
+    elif key == "auth" and len(parts) >= 2:
+        auth_digest = parts[1]
+
+if inline_block is not None:
+    raise SystemExit(
+        f"ovpn parse: unterminated <{inline_block}> block (no closing "
+        f"</{inline_block}> tag). Silent truncation would have stored a "
+        f"partial PEM in node.json."
+    )
+
+if server is None:
+    raise SystemExit("ovpn parse: no 'remote' directive found")
+if port is None:
+    port = 1194
+
+def read_inline_or_file(name):
+    if name in inline_buffers:
+        return "\n".join(inline_buffers[name]).strip() + "\n"
+    # Try external file referenced via directive like `ca my-ca.crt`.
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+            continue
+        try:
+            parts = shlex.split(stripped)
+        except ValueError:
+            continue
+        if len(parts) >= 2 and parts[0] == name:
+            candidate = Path(parts[1])
+            if not candidate.is_absolute():
+                candidate = source_dir / candidate
+            if candidate.exists():
+                return candidate.read_text()
+    return None
+
+ca_pem        = read_inline_or_file("ca")
+tls_crypt_pem = read_inline_or_file("tls-crypt")
+tls_auth_pem  = read_inline_or_file("tls-auth")
+cert_pem      = read_inline_or_file("cert")
+key_pem       = read_inline_or_file("key")
+
+if ca_pem is None:
+    raise SystemExit("ovpn parse: no <ca> block or 'ca' file directive found")
+
+block = {
+    "server": server,
+    "port":   port,
+    "proto":  proto,
+    "ca_pem": ca_pem,
+}
+if tls_crypt_pem:
+    block["tls_crypt_pem"] = tls_crypt_pem
+elif tls_auth_pem:
+    # mihomo's openvpn proxy accepts tls-crypt-style static keys via the same
+    # field; downstream renderer will surface this verbatim.
+    block["tls_crypt_pem"] = tls_auth_pem
+if cert_pem and key_pem:
+    block["cert_pem"] = cert_pem
+    block["key_pem"]  = key_pem
+if cipher:
+    block["cipher"] = cipher
+if auth_digest:
+    block["auth"] = auth_digest
+
+if auth_path:
+    lines = Path(auth_path).read_text().splitlines()
+    if len(lines) < 2:
+        raise SystemExit("auth file must have at least 2 lines: username, password")
+    block["username"] = lines[0].strip()
+    block["password"] = lines[1].strip()
+
+with open(output_path, "w") as fh:
+    json.dump(block, fh, indent=2)
+    fh.write("\n")
+PY
+}
+
+# prepare_sidecar_conf <ovpn_path> <ips_txt> <output_conf> — produce a
+# self-contained OpenVPN config for the openvpn-corp sidecar:
+#   - inline any external ca/cert/key/tls-auth/tls-crypt files
+#   - strip `auth-user-pass` (the sidecar supplies credentials via
+#     --auth-user-pass <file>; a bare directive would be a fatal duplicate)
+#   - append the corporate routes from config/ips.txt as `route` directives so
+#     the declared corp subnets egress via the tunnel even if the server does
+#     not push them. The sidecar is network-isolated, so (unlike the old
+#     host-level client) it safely pulls server routes/DNS too — corp DNS from
+#     the push is what resolves DOMAIN-SUFFIX corp rules inside the container.
+prepare_sidecar_conf() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import ipaddress, shlex, sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+ips_txt = Path(sys.argv[2])
+out = Path(sys.argv[3])
+source_dir = src.parent
+inline_directives = {"ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2"}
+
+lines_out = []
+inline_block = None
+for raw in src.read_text().splitlines():
+    stripped = raw.strip()
+    # Pass through (and track) existing inline <...> blocks verbatim.
+    if inline_block is not None:
+        lines_out.append(raw)
+        if stripped == f"</{inline_block}>":
+            inline_block = None
+        continue
+    if stripped.startswith("<") and stripped.endswith(">") and not stripped.startswith("</"):
+        inline_block = stripped[1:-1]
+        lines_out.append(raw)
+        continue
+    try:
+        parts = shlex.split(stripped) if stripped else []
+    except ValueError:
+        parts = []
+    key = parts[0] if parts else ""
+    # Drop auth-user-pass; credentials come from the command line.
+    if key == "auth-user-pass":
+        continue
+    # Inline an external file referenced by a directive with a path argument.
+    if key in inline_directives and len(parts) >= 2:
+        candidate = Path(parts[1])
+        if not candidate.is_absolute():
+            candidate = source_dir / candidate
+        if candidate.exists():
+            content = candidate.read_text().rstrip("\n")
+            lines_out.append(f"<{key}>")
+            lines_out.append(content)
+            lines_out.append(f"</{key}>")
+            continue
+    lines_out.append(raw)
+
+# Append corporate routes from ips.txt as explicit `route net mask` directives.
+if ips_txt.exists():
+    routes = []
+    for lineno, raw in enumerate(ips_txt.read_text().splitlines(), 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("route "):
+            p = s.split()
+            if len(p) == 3:
+                net = ipaddress.ip_network(f"{p[1]}/{p[2]}", strict=False)
+            elif len(p) == 2:
+                net = ipaddress.ip_network(p[1], strict=False)
+            else:
+                raise SystemExit(f"{ips_txt}:{lineno}: unrecognized route form: {s!r}")
+        elif "/" in s:
+            net = ipaddress.ip_network(s, strict=False)
+        else:
+            raise SystemExit(f"{ips_txt}:{lineno}: expected 'route ...' or a CIDR, got {s!r}")
+        routes.append(net)
+    if routes:
+        lines_out.append("")
+        lines_out.append("# corporate routes (appended from config/ips.txt)")
+        for net in routes:
+            lines_out.append(f"route {net.network_address} {net.netmask}")
+
+out.write_text("\n".join(lines_out) + "\n")
+PY
+}
+
+# parse_outline_uri <uri> — prints JSON {"name","address","port","method","password"} for one URI.
+parse_outline_uri() {
+  python3 - "$1" "$2" <<'PY'
+import base64
+import json
+import sys
+from urllib.parse import urlparse, unquote
+
+uri = sys.argv[1]
+default_name = sys.argv[2]
+parsed = urlparse(uri)
+if parsed.scheme != "ss":
+    raise SystemExit(f"Outline URI must start with ss:// (got scheme={parsed.scheme!r})")
+if not parsed.hostname:
+    raise SystemExit("Outline URI must contain a host")
+creds = parsed.netloc.rsplit("@", 1)[0]
+try:
+    decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
+except Exception as exc:
+    raise SystemExit(f"Outline URI userinfo is not valid base64: {exc}")
+if ":" not in decoded:
+    raise SystemExit("Decoded Outline creds must be METHOD:PASSWORD")
+method, password = decoded.split(":", 1)
+port = parsed.port if parsed.port is not None else 8388
+name = unquote(parsed.fragment) if parsed.fragment else default_name
+print(json.dumps({
+    "name":     name,
+    "address":  parsed.hostname,
+    "port":     port,
+    "method":   method,
+    "password": password,
+}))
+PY
+}
+
 HOST=""
 SSH_USER="root"
 SSH_PORT="22"
 CORP_OVPN=""
 AUTH_FILE=""
-OUTLINE_URI=""
+OUTLINE_URIS=()
 LISTEN_PORT="443"
-SERVER_NAME="yandex.ru"
-REALITY_DEST="yandex.ru:443"
 CLIENT_NAME="laptop"
 INSTALL_DIR="/opt/tristate-relay"
 STATE_ROOT="${REPO_ROOT}/state"
@@ -112,10 +381,15 @@ while [[ $# -gt 0 ]]; do
     --ssh-port) SSH_PORT="$2"; shift 2 ;;
     --corp-ovpn) CORP_OVPN="$2"; shift 2 ;;
     --auth-file) AUTH_FILE="$2"; shift 2 ;;
-    --outline-uri) OUTLINE_URI="$2"; shift 2 ;;
+    --outline-uri) OUTLINE_URIS+=("$2"); shift 2 ;;
+    --outline-uris|--outline-uris-csv)
+      IFS=',' read -r -a _csv <<< "$2"
+      for _u in "${_csv[@]}"; do
+        _u="${_u## }"; _u="${_u%% }"
+        [[ -n "${_u}" ]] && OUTLINE_URIS+=("${_u}")
+      done
+      shift 2 ;;
     --listen-port) LISTEN_PORT="$2"; shift 2 ;;
-    --server-name) SERVER_NAME="$2"; shift 2 ;;
-    --reality-dest) REALITY_DEST="$2"; shift 2 ;;
     --client-name) CLIENT_NAME="$2"; shift 2 ;;
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --state-root) STATE_ROOT="$2"; shift 2 ;;
@@ -126,7 +400,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${HOST}" || -z "${CORP_OVPN}" || -z "${OUTLINE_URI}" ]]; then
+if [[ -z "${HOST}" || -z "${CORP_OVPN}" || ${#OUTLINE_URIS[@]} -eq 0 ]]; then
   usage >&2
   exit 1
 fi
@@ -134,11 +408,11 @@ fi
 for cmd in ssh scp python3; do
   require_cmd "${cmd}"
 done
-if [[ "${DRY_RUN}" == "1" ]]; then
-  require_cmd curl
+if [[ "${DRY_RUN}" != "1" ]]; then
+  require_cmd openssl
 fi
 
-for file in "${CORP_OVPN}" "${CONFIG_DIR}/ips.txt" "${SCRIPT_DIR}/remote_apply_node.sh" "${CONFIG_DIR}/xray_config.template.json"; do
+for file in "${CORP_OVPN}" "${CONFIG_DIR}/ips.txt" "${SCRIPT_DIR}/remote_apply_node.sh" "${CONFIG_DIR}/mihomo_config.template.yaml" "${SCRIPT_DIR}/render_mihomo.py" "${SCRIPT_DIR}/render_mihomo_client.py" "${SIDECAR_BUILD_DIR}/Dockerfile" "${SIDECAR_BUILD_DIR}/entrypoint.sh"; do
   if [[ ! -f "${file}" ]]; then
     echo "Required file not found: ${file}" >&2
     exit 1
@@ -153,17 +427,19 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
-
-ssh_opts=(-p "${SSH_PORT}" -o BatchMode=no -o StrictHostKeyChecking=accept-new)
-scp_opts=(-P "${SSH_PORT}" -o StrictHostKeyChecking=accept-new)
+ssh_opts=(-p "${SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+scp_opts=(-P "${SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 if [[ -n "${SSH_IDENTITY}" ]]; then
   ssh_opts+=(-i "${SSH_IDENTITY}")
   scp_opts+=(-i "${SSH_IDENTITY}")
 fi
 
-remote_stage="/tmp/tristate-relay-$RANDOM"
+# remote_stage is allocated after preflight (see below) via ssh-side
+# `mktemp -d` so the name is unpredictable (no $RANDOM collision risk on
+# concurrent runs) and the dir is 0700 by default.
+remote_stage=""
 
-echo "[0/6] Preflight: verifying SSH and passwordless sudo on ${SSH_USER}@${HOST}:${SSH_PORT}"
+echo "[0/5] Preflight: verifying SSH and passwordless sudo on ${SSH_USER}@${HOST}:${SSH_PORT}"
 if ! ssh "${ssh_opts[@]}" -o ConnectTimeout=10 "${SSH_USER}@${HOST}" "true" >/dev/null 2>&1; then
   echo "Cannot SSH to ${SSH_USER}@${HOST}:${SSH_PORT}. Check --host/--ssh-port/--ssh-identity." >&2
   exit 1
@@ -179,65 +455,54 @@ if [[ -n "${actual_ssh_port}" && "${actual_ssh_port}" != "${SSH_PORT}" ]]; then
   exit 1
 fi
 
-echo "[0/6] Preflight: verifying REALITY dest ${REALITY_DEST} supports TLS 1.3 + X25519 from the VPS"
-reality_host="${REALITY_DEST%:*}"
-reality_port="${REALITY_DEST##*:}"
-reality_probe="$(ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
-  "if ! command -v openssl >/dev/null 2>&1; then echo __NO_OPENSSL__; else openssl s_client -connect $(quote_sh "${reality_host}:${reality_port}") -servername $(quote_sh "${SERVER_NAME}") -tls1_3 -groups X25519 </dev/null 2>&1; fi" \
-  2>/dev/null || true)"
-if printf '%s' "${reality_probe}" | grep -q '__NO_OPENSSL__'; then
-  echo "  openssl not present on VPS; skipping REALITY-dest TLS probe." >&2
-elif ! printf '%s' "${reality_probe}" | grep -qE 'Protocol *: *TLSv1\.3|New, TLSv1\.3,'; then
-  echo "  ERROR: ${reality_host}:${reality_port} did not negotiate TLS 1.3 from the VPS. Pick a different --reality-dest." >&2
-  printf '%s\n' "${reality_probe}" | tail -20 >&2
-  exit 1
-elif ! printf '%s' "${reality_probe}" | grep -qiE '(Server|Peer) Temp Key: *X25519|Negotiated .*: *x25519'; then
-  echo "  ERROR: ${reality_host}:${reality_port} did not negotiate X25519. REALITY requires X25519 key exchange." >&2
-  printf '%s\n' "${reality_probe}" | grep -iE 'Temp Key|Protocol|Cipher' >&2 || true
-  exit 1
-else
-  echo "  ok: ${reality_host}:${reality_port} negotiated TLS 1.3 with X25519"
-fi
-
+# --- Dry-run path ------------------------------------------------------------
 if [[ "${DRY_RUN}" == "1" ]]; then
-  echo "[dry-run] Validating Outline URI"
-  python3 - "${OUTLINE_URI}" <<'PY'
-import base64
-import sys
-from urllib.parse import urlparse
+  echo "[dry-run] Validating ${#OUTLINE_URIS[@]} Outline URI(s)"
+  outline_json_array="["
+  first=1
+  idx=0
+  for uri in "${OUTLINE_URIS[@]}"; do
+    idx=$((idx + 1))
+    entry="$(parse_outline_uri "${uri}" "endpoint-${idx}")"
+    echo "  ${entry}"
+    if [[ "${first}" == "1" ]]; then
+      outline_json_array+="${entry}"
+      first=0
+    else
+      outline_json_array+=",${entry}"
+    fi
+  done
+  outline_json_array+="]"
 
-uri = sys.argv[1]
-parsed = urlparse(uri)
-if parsed.scheme != "ss":
-    raise SystemExit(f"Outline URI must start with ss:// (got scheme={parsed.scheme!r})")
-if not parsed.hostname:
-    raise SystemExit("Outline URI must contain a host")
-creds = parsed.netloc.rsplit("@", 1)[0]
-try:
-    decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
-except Exception as exc:
-    raise SystemExit(f"Outline URI userinfo is not valid base64: {exc}")
-if ":" not in decoded:
-    raise SystemExit("Decoded Outline creds must be METHOD:PASSWORD")
-method, _ = decoded.split(":", 1)
-op = parsed.port if parsed.port is not None else 8388
-print(f"  scheme=ss host={parsed.hostname} port={op} method={method}")
+  echo "[dry-run] Parsing OpenVPN config ${CORP_OVPN}"
+  parse_ovpn "${CORP_OVPN}" "${AUTH_FILE}" "${tmp_dir}/openvpn_corp.json"
+  python3 - "${tmp_dir}/openvpn_corp.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+fields = [f"server={d['server']}", f"port={d['port']}", f"proto={d['proto']}"]
+if "username" in d: fields.append(f"username={d['username']}")
+if "cipher" in d:   fields.append(f"cipher={d['cipher']}")
+if "auth" in d:     fields.append(f"auth={d['auth']}")
+fields.append(f"ca_pem={'present' if d.get('ca_pem') else 'missing'}")
+fields.append(f"tls_crypt={'present' if d.get('tls_crypt_pem') else 'missing'}")
+fields.append(f"client_cert={'present' if d.get('cert_pem') else 'missing'}")
+print("  " + ", ".join(fields))
 PY
 
-  echo "[dry-run] Enumerating OpenVPN dependencies"
+  echo "[dry-run] Enumerating OpenVPN external file dependencies"
   dep_count=0
   while IFS= read -r dep_file; do
     [[ -z "${dep_file}" ]] && continue
     echo "  dep: ${dep_file}"
     dep_count=$((dep_count + 1))
   done < <(list_ovpn_dependencies "${CORP_OVPN}")
-  echo "  ${dep_count} external file(s) would be uploaded"
+  echo "  ${dep_count} external file(s) will be inlined into node.json locally"
 
-  echo "[dry-run] Checking remote listen port ${LISTEN_PORT}/tcp is free"
+  echo "[dry-run] Checking remote listen port ${LISTEN_PORT}/udp is free"
   port_in_use="$(ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
-    "ss -H -ltn 'sport = :${LISTEN_PORT}' 2>/dev/null | wc -l" 2>/dev/null || echo 0)"
+    "ss -H -lun 'sport = :${LISTEN_PORT}' 2>/dev/null | wc -l" 2>/dev/null || echo 0)"
   if [[ "${port_in_use}" -gt 0 ]]; then
-    echo "  WARNING: port ${LISTEN_PORT}/tcp already has a listener on the VPS" >&2
+    echo "  WARNING: port ${LISTEN_PORT}/udp already has a listener on the VPS" >&2
   else
     echo "  ok"
   fi
@@ -250,145 +515,103 @@ PY
     echo "  ${remote_free} KiB free on /"
   fi
 
-  echo "[dry-run] Rendering Xray config locally with ephemeral REALITY keys (docker x25519)"
-  mkdir -p "${tmp_dir}"
-  dry_private=""
-  dry_public=""
-  if command -v docker >/dev/null 2>&1; then
-    dry_keys="$(docker run --rm --entrypoint xray "${XRAY_IMAGE}" x25519 2>/dev/null || true)"
-    dry_private="$(printf '%s\n' "${dry_keys}" | awk '/^PrivateKey:/ {print $2; exit} /^Private key:/ {print $3; exit}')"
-    dry_public="$(printf '%s\n' "${dry_keys}" | awk '/Password \(PublicKey\):/ {print $NF; exit} /^Public key:/ {print $3; exit}')"
-  fi
-  if [[ -z "${dry_private}" || -z "${dry_public}" ]]; then
-    echo "[dry-run] WARNING: could not generate x25519 keys via docker; REALITY section will use invalid placeholders and xray run -test will be skipped." >&2
-    dry_private="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-    dry_public="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-  fi
-  cat >"${tmp_dir}/fake-node.json" <<EOF
-{
-  "host": "${HOST}",
-  "ssh_user": "${SSH_USER}",
-  "ssh_port": ${SSH_PORT},
-  "install_dir": "${INSTALL_DIR}",
-  "listen_port": ${LISTEN_PORT},
-  "server_name": "${SERVER_NAME}",
-  "reality_dest": "${REALITY_DEST}",
-  "short_id": "0123456789abcdef",
-  "reality_private_key": "${dry_private}",
-  "reality_public_key":  "${dry_public}",
-  "outline": $(python3 - "${OUTLINE_URI}" <<'PY'
-import base64
-import json
-import sys
-from urllib.parse import urlparse
+  echo "[dry-run] Rendering mihomo config locally with placeholder hy2 cert"
+  # Placeholder cert/key/fingerprint in dry-run: noted as fake.
+  echo "[dry-run] (using placeholder hy2 cert/key/fingerprint; live run generates real ones via openssl)"
+  fake_cert="-----BEGIN CERTIFICATE-----\nDRYRUN\n-----END CERTIFICATE-----\n"
+  fake_key="-----BEGIN PRIVATE KEY-----\nDRYRUN\n-----END PRIVATE KEY-----\n"
+  fake_fp="00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
 
-parsed = urlparse(sys.argv[1])
-creds = parsed.netloc.rsplit("@", 1)[0]
-decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
-method, password = decoded.split(":", 1)
-op = parsed.port if parsed.port is not None else 8388
-print(json.dumps({"address": parsed.hostname, "port": op, "method": method, "password": password}))
-PY
-)
+  python3 - \
+    "${HOST}" "${SSH_USER}" "${SSH_PORT}" "${INSTALL_DIR}" "${LISTEN_PORT}" \
+    "${fake_cert}" "${fake_key}" "${fake_fp}" \
+    "${outline_json_array}" "${tmp_dir}/openvpn_corp.json" "${tmp_dir}/fake-node.json" <<'PY'
+import json, sys
+(host, ssh_user, ssh_port, install_dir, listen_port,
+ cert_pem, key_pem, fp,
+ outline_json, ovpn_path, output) = sys.argv[1:]
+outline = json.loads(outline_json)
+ovpn    = json.load(open(ovpn_path))
+node = {
+    "host": host,
+    "ssh_user": ssh_user,
+    "ssh_port": int(ssh_port),
+    "install_dir": install_dir,
+    "listen_port": int(listen_port),
+    "hysteria2": {
+        "cert_pem": cert_pem,
+        "key_pem":  key_pem,
+        "cert_fingerprint_sha256": fp,
+    },
+    "outline": outline,
+    "openvpn_corp": ovpn,
 }
-EOF
+with open(output, "w") as fh:
+    json.dump(node, fh, indent=2)
+    fh.write("\n")
+PY
+
+  # Fake clients.json for dry-run.
   cat >"${tmp_dir}/fake-clients.json" <<EOF
-[{"email": "${CLIENT_NAME}", "id": "00000000-0000-4000-8000-000000000000", "flow": "xtls-rprx-vision"}]
+[{"email": "${CLIENT_NAME}", "password": "dry-run-placeholder-password"}]
 EOF
 
   corp_domains_arg="${CONFIG_DIR}/corporate_domains.txt"
   [[ ! -f "${corp_domains_arg}" ]] && corp_domains_arg=""
-  python3 - "${CONFIG_DIR}/xray_config.template.json" "${tmp_dir}/fake-node.json" "${CONFIG_DIR}/ips.txt" "${tmp_dir}/fake-clients.json" "${tmp_dir}/rendered.json" "${corp_domains_arg}" <<'PY'
-import ipaddress
-import json
-import sys
-from string import Template
 
-template_path, node_path, routes_path, clients_path, output_path, corp_domains_path = sys.argv[1:]
-template = Template(open(template_path).read())
-node = json.load(open(node_path))
-clients = json.load(open(clients_path))
+  python3 "${SCRIPT_DIR}/render_mihomo.py" \
+    --template "${CONFIG_DIR}/mihomo_config.template.yaml" \
+    --node "${tmp_dir}/fake-node.json" \
+    --clients "${tmp_dir}/fake-clients.json" \
+    --routes "${CONFIG_DIR}/ips.txt" \
+    --corp-domains "${corp_domains_arg}" \
+    --output "${tmp_dir}/rendered.yaml"
 
-ips = []
-for line in open(routes_path):
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#") or not stripped.startswith("route "):
-        continue
-    _, address, mask = stripped.split()
-    ips.append(str(ipaddress.IPv4Network(f"{address}/{mask}", strict=False)))
-
-domains = []
-if corp_domains_path:
-    for line in open(corp_domains_path):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        domains.append(stripped)
-if not domains:
-    domains = ["regexp:^$"]
-
-config = template.substitute(
-    LISTEN_PORT=node["listen_port"],
-    SERVER_NAME=json.dumps(node["server_name"]),
-    REALITY_DEST=json.dumps(node["reality_dest"]),
-    REALITY_PRIVATE_KEY=json.dumps(node["reality_private_key"]),
-    SHORT_ID=json.dumps(node["short_id"]),
-    CLIENTS=json.dumps(clients, indent=6),
-    OUTLINE_ADDRESS=json.dumps(node["outline"]["address"]),
-    OUTLINE_PORT=node["outline"]["port"],
-    OUTLINE_METHOD=json.dumps(node["outline"]["method"]),
-    OUTLINE_PASSWORD=json.dumps(node["outline"]["password"]),
-    CORPORATE_IPS=json.dumps(ips, indent=8),
-    CORPORATE_DOMAINS=json.dumps(domains, indent=8),
-)
-parsed = json.loads(config)
-with open(output_path, "w") as handle:
-    json.dump(parsed, handle, indent=2)
-print(f"  rendered JSON is valid ({len(parsed.get('inbounds', []))} inbounds, {len(parsed.get('outbounds', []))} outbounds, {len(parsed.get('routing', {}).get('rules', []))} routing rules)")
+  # Validate output is parseable JSON (mihomo accepts JSON-in-YAML).
+  python3 - "${tmp_dir}/rendered.yaml" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1]))
+proxies = obj.get("proxies", [])
+rules   = obj.get("rules", [])
+listeners = obj.get("listeners", []) or obj.get("hysteria2", [])
+print(f"  rendered JSON is valid ({len(proxies)} proxies, {len(rules)} rules)")
 PY
 
   if command -v docker >/dev/null 2>&1; then
-    if [[ "${dry_private}" == AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ]]; then
-      echo "[dry-run] Skipping 'xray run -test' (no valid x25519 keys from docker)."
+    echo "[dry-run] Running 'mihomo -t' locally via docker"
+    mkdir -p "${tmp_dir}/mihomo-home"
+    cp "${tmp_dir}/rendered.yaml" "${tmp_dir}/mihomo-home/config.yaml"
+    # Mount read-write: GEOSITE/GEOIP rules make mihomo download the .dat files
+    # into its working dir during -t (same as production deploy-config). A
+    # read-only mount would fail rule validation on the geo download.
+    if docker run --rm \
+      -v "${tmp_dir}/mihomo-home:/root/.config/mihomo" \
+      "${MIHOMO_IMAGE}" -t -d /root/.config/mihomo &>"${tmp_dir}/mihomo.out"; then
+      echo "  mihomo -t: PASS"
     else
-      echo "[dry-run] Running 'xray run -test' locally via docker"
-      mkdir -p "${tmp_dir}/xray-assets"
-      curl -fsSL "${LOYALSOLDIER_GEOSITE_URL}" -o "${tmp_dir}/xray-assets/geosite.dat"
-      curl -fsSL "${LOYALSOLDIER_GEOIP_URL}" -o "${tmp_dir}/xray-assets/geoip.dat"
-      if docker run --rm --entrypoint xray \
-        -e XRAY_LOCATION_ASSET=/usr/local/share/xray \
-        -v "${tmp_dir}/rendered.json:/etc/xray/config.json:ro" \
-        -v "${tmp_dir}/xray-assets:/usr/local/share/xray:ro" \
-        "${XRAY_IMAGE}" \
-        run -test -config /etc/xray/config.json &>"${tmp_dir}/xray.out"; then
-        echo "  xray run -test: PASS"
-      else
-        echo "  xray run -test: FAIL" >&2
-        cat "${tmp_dir}/xray.out" >&2
-        exit 1
-      fi
+      echo "  mihomo -t: FAIL" >&2
+      cat "${tmp_dir}/mihomo.out" >&2
+      exit 1
     fi
   else
-    echo "[dry-run] docker not found locally; skipping 'xray run -test' (structural JSON check only)"
+    echo "[dry-run] docker not found locally; skipping 'mihomo -t' (structural JSON check only)"
   fi
 
   existing_state="no"
   if [[ -f "${STATE_ROOT}/${HOST}/node.json" ]]; then
-    existing_state="yes (REALITY keys + short_id would be reused; OpenVPN/Xray would be redeployed)"
+    existing_state="yes (hy2 cert + client passwords would be reused if present)"
   fi
   cat <<EOF
 
 Dry run OK. Summary:
   host:            ${SSH_USER}@${HOST}:${SSH_PORT}
-  listen port:     ${LISTEN_PORT}/tcp
-  REALITY SNI:     ${SERVER_NAME}
-  REALITY dest:    ${REALITY_DEST}
+  listen port:     ${LISTEN_PORT}/udp (hysteria2)
   install dir:     ${INSTALL_DIR}
   state dir:       ${STATE_ROOT}/${HOST}
   existing state:  ${existing_state}
   ovpn:            ${CORP_OVPN}
   auth file:       ${AUTH_FILE:-<none>}
-  outline:         (validated)
+  outline endpoints: ${#OUTLINE_URIS[@]} (validated)
   bootstrap client: ${CLIENT_NAME}
 
 No changes were made. Re-run without --dry-run to apply.
@@ -396,243 +619,185 @@ EOF
   exit 0
 fi
 
+# --- Live path ---------------------------------------------------------------
 cleanup_remote() {
+  [[ -z "${remote_stage}" ]] && return 0
   ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" "rm -rf $(quote_sh "${remote_stage}")" >/dev/null 2>&1 || true
 }
 trap 'rc=$?; rm -rf "${tmp_dir}"; cleanup_remote; exit $rc' EXIT
 
-echo "[1/6] Uploading bootstrap assets to ${SSH_USER}@${HOST}:${remote_stage}"
-ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" "mkdir -p $(quote_sh "${remote_stage}")"
-upload_files=(
-  "${SCRIPT_DIR}/remote_apply_node.sh"
-  "${CONFIG_DIR}/ips.txt"
-  "${CORP_OVPN}"
-)
-while IFS= read -r dep_file; do
-  [[ -n "${dep_file}" ]] && upload_files+=("${dep_file}")
-done < <(list_ovpn_dependencies "${CORP_OVPN}")
-scp "${scp_opts[@]}" "${upload_files[@]}" "${SSH_USER}@${HOST}:${remote_stage}/"
-if [[ -n "${AUTH_FILE}" ]]; then
-  scp "${scp_opts[@]}" "${AUTH_FILE}" "${SSH_USER}@${HOST}:${remote_stage}/corporate.auth"
-fi
+# Allocate remote stage now (post-preflight, so SSH is known good). mktemp -d
+# returns a 0700 dir with an unpredictable name — avoids $RANDOM collisions
+# when two provision runs target the same VPS concurrently.
+remote_stage="$(ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" "mktemp -d /tmp/tristate-relay-XXXXXXXX")"
 
-echo "[2/6] Bootstrapping the VPS"
-bootstrap_output="$(
-  ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
-    "chmod +x $(quote_sh "${remote_stage}/remote_apply_node.sh") && sudo $(quote_sh "${remote_stage}/remote_apply_node.sh") bootstrap \
-      --install-dir $(quote_sh "${INSTALL_DIR}") \
-      --ssh-port $(quote_sh "${SSH_PORT}") \
-      --listen-port $(quote_sh "${LISTEN_PORT}") \
-      --server-name $(quote_sh "${SERVER_NAME}") \
-      --reality-dest $(quote_sh "${REALITY_DEST}") \
-      --ovpn $(quote_sh "${remote_stage}/$(basename "${CORP_OVPN}")") \
-      --routes $(quote_sh "${remote_stage}/ips.txt") \
-      ${AUTH_FILE:+--auth-file $(quote_sh "${remote_stage}/corporate.auth")}"
-)"
+echo "[1/5] Uploading bootstrap helper + openvpn-corp sidecar to ${SSH_USER}@${HOST}:${remote_stage}"
+# The bootstrap helper, the sidecar build context, and the corporate OpenVPN
+# bundle land on the VPS. mihomo routes corp traffic to the openvpn-corp
+# sidecar's SOCKS5 proxy; the sidecar (a real openvpn client) holds the
+# corporate tunnel. The hy2 cert, Outline endpoints, and routing rules are
+# still rendered locally into the mihomo config.
+scp "${scp_opts[@]}" "${SCRIPT_DIR}/remote_apply_node.sh" "${SSH_USER}@${HOST}:${remote_stage}/"
+scp "${scp_opts[@]}" -r "${SIDECAR_BUILD_DIR}" "${SSH_USER}@${HOST}:${remote_stage}/openvpn-corp-build"
 
-bootstrap_json="$(printf '%s\n' "${bootstrap_output}" | awk '/^__TRISTATE_BOOTSTRAP_JSON__ /{sub(/^__TRISTATE_BOOTSTRAP_JSON__ /,""); print; exit}')"
-if [[ -z "${bootstrap_json}" ]]; then
-  echo "Bootstrap did not return a JSON payload. Remote output:" >&2
-  printf '%s\n' "${bootstrap_output}" >&2
+# Build the self-contained sidecar OpenVPN config (inline deps, no
+# auth-user-pass) and stage it with the auth file.
+prepare_sidecar_conf "${CORP_OVPN}" "${CONFIG_DIR}/ips.txt" "${tmp_dir}/corporate.conf"
+if grep -q '^auth-user-pass' "${CORP_OVPN}" && [[ -z "${AUTH_FILE}" ]]; then
+  echo "ERROR: ${CORP_OVPN} requires auth-user-pass but no --auth-file was given." >&2
+  echo "The openvpn-corp sidecar needs a two-line user/pass file. Aborting." >&2
   exit 1
 fi
-printf '%s\n' "${bootstrap_json}" >"${tmp_dir}/bootstrap.json"
+if [[ -n "${AUTH_FILE}" ]]; then
+  cp "${AUTH_FILE}" "${tmp_dir}/corporate.auth"
+else
+  : > "${tmp_dir}/corporate.auth"
+fi
+scp "${scp_opts[@]}" "${tmp_dir}/corporate.conf" "${tmp_dir}/corporate.auth" \
+  "${SSH_USER}@${HOST}:${remote_stage}/"
+ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
+  "chmod 600 $(quote_sh "${remote_stage}/corporate.conf") $(quote_sh "${remote_stage}/corporate.auth")"
+
+echo "[1/5] Generating hy2 self-signed EC P-256 cert/key locally"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -days 3650 -nodes -subj "/CN=tristate.local" \
+  -keyout "${tmp_dir}/hy2.key" -out "${tmp_dir}/hy2.crt" >/dev/null 2>&1
+hy2_fp="$(openssl x509 -in "${tmp_dir}/hy2.crt" -noout -fingerprint -sha256 \
+  | sed 's/^.*=//; s/://g; s/\(..\)/\1:/g; s/:$//')"
+echo "  fingerprint: ${hy2_fp}"
+
+echo "[2/5] Bootstrapping the VPS"
+ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
+  "chmod +x $(quote_sh "${remote_stage}/remote_apply_node.sh") && sudo $(quote_sh "${remote_stage}/remote_apply_node.sh") bootstrap \
+    --install-dir $(quote_sh "${INSTALL_DIR}") \
+    --ssh-port $(quote_sh "${SSH_PORT}") \
+    --listen-port $(quote_sh "${LISTEN_PORT}")"
+
+echo "[2/5] Building + starting the openvpn-corp sidecar (corporate tunnel)"
+ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
+  "sudo $(quote_sh "${remote_stage}/remote_apply_node.sh") deploy-sidecar \
+    --install-dir $(quote_sh "${INSTALL_DIR}") \
+    --build-context $(quote_sh "${remote_stage}/openvpn-corp-build") \
+    --ovpn $(quote_sh "${remote_stage}/corporate.conf") \
+    --auth $(quote_sh "${remote_stage}/corporate.auth")"
 
 state_dir="${STATE_ROOT}/${HOST}"
 mkdir -p "${state_dir}"
 
-if [[ -f "${state_dir}/node.json" ]]; then
-  python3 - "${state_dir}/node.json" "${tmp_dir}/bootstrap.json" <<'PY' || true
-import json
-import sys
+# Parse ovpn for the live node.json.
+parse_ovpn "${CORP_OVPN}" "${AUTH_FILE}" "${tmp_dir}/openvpn_corp.json"
 
-old = json.load(open(sys.argv[1]))
-new = json.load(open(sys.argv[2]))
-old_pub = old.get("reality_public_key")
-new_pub = new.get("reality_public_key")
-if old_pub and new_pub and old_pub != new_pub:
-    print(
-        "WARNING: REALITY public key on the VPS changed since the last provision.\n"
-        f"  old: {old_pub}\n  new: {new_pub}\n"
-        "All existing client URIs are invalidated and must be reissued.",
-        file=sys.stderr,
-    )
-PY
-fi
+# Build outline JSON array.
+outline_json_array="["
+first=1
+idx=0
+for uri in "${OUTLINE_URIS[@]}"; do
+  idx=$((idx + 1))
+  entry="$(parse_outline_uri "${uri}" "endpoint-${idx}")"
+  if [[ "${first}" == "1" ]]; then
+    outline_json_array+="${entry}"
+    first=0
+  else
+    outline_json_array+=",${entry}"
+  fi
+done
+outline_json_array+="]"
 
-if [[ -f "${state_dir}/node.json" ]]; then
-  short_id="$(python3 - "${state_dir}/node.json" <<'PY'
-import json
-import sys
-
-print(json.load(open(sys.argv[1]))["short_id"])
-PY
-)"
-else
-  short_id="$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(4))
-PY
-)"
-fi
-
-echo "[3/6] Writing local state to ${state_dir}"
-python3 - "$HOST" "$SSH_USER" "$SSH_PORT" "$INSTALL_DIR" "$LISTEN_PORT" "$SERVER_NAME" "$REALITY_DEST" "$OUTLINE_URI" "$short_id" "${tmp_dir}/bootstrap.json" "${state_dir}/node.json" <<'PY'
-import base64
-import json
-import sys
-from urllib.parse import urlparse
-
-host, ssh_user, ssh_port, install_dir, listen_port, server_name, reality_dest, outline_uri, short_id, bootstrap_path, output_path = sys.argv[1:]
-bootstrap = json.load(open(bootstrap_path))
-
-parsed = urlparse(outline_uri)
-if parsed.scheme != "ss":
-    raise SystemExit("Outline URI must start with ss://")
-
-creds = parsed.netloc.rsplit("@", 1)[0]
-server = parsed.hostname
-port = parsed.port if parsed.port is not None else 8388
-decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
-method, password = decoded.split(":", 1)
-
+echo "[3/5] Writing local state to ${state_dir}"
+# Read the freshly-generated cert/key as text so they embed in node.json.
+hy2_cert_pem="$(cat "${tmp_dir}/hy2.crt")"
+hy2_key_pem="$(cat "${tmp_dir}/hy2.key")"
+python3 - \
+  "${HOST}" "${SSH_USER}" "${SSH_PORT}" "${INSTALL_DIR}" "${LISTEN_PORT}" \
+  "${hy2_fp}" \
+  "${outline_json_array}" "${tmp_dir}/openvpn_corp.json" \
+  "${tmp_dir}/hy2.crt" "${tmp_dir}/hy2.key" \
+  "${state_dir}/node.json" <<'PY'
+import json, sys
+(host, ssh_user, ssh_port, install_dir, listen_port,
+ fp, outline_json, ovpn_path, cert_path, key_path, output) = sys.argv[1:]
+outline = json.loads(outline_json)
+ovpn    = json.load(open(ovpn_path))
+cert_pem = open(cert_path).read()
+key_pem  = open(key_path).read()
 node = {
     "host": host,
     "ssh_user": ssh_user,
     "ssh_port": int(ssh_port),
     "install_dir": install_dir,
     "listen_port": int(listen_port),
-    "server_name": server_name,
-    "reality_dest": reality_dest,
-    "short_id": short_id,
-    "reality_private_key": bootstrap["reality_private_key"],
-    "reality_public_key": bootstrap["reality_public_key"],
-    "outline": {
-        "address": server,
-        "port": port,
-        "method": method,
-        "password": password,
+    "hysteria2": {
+        "cert_pem": cert_pem,
+        "key_pem":  key_pem,
+        "cert_fingerprint_sha256": fp,
     },
+    "outline": outline,
+    "openvpn_corp": ovpn,
 }
-
-with open(output_path, "w") as handle:
-    json.dump(node, handle, indent=2)
-    handle.write("\n")
+with open(output, "w") as fh:
+    json.dump(node, fh, indent=2)
+    fh.write("\n")
 PY
+chmod 700 "${state_dir}"
+chmod 600 "${state_dir}/node.json"
 
+# Bootstrap client password (token_urlsafe(24)).
 if [[ ! -f "${state_dir}/clients.json" ]]; then
-  client_uuid="$(python3 - <<'PY'
-import uuid
-print(uuid.uuid4())
+  client_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  python3 - "${CLIENT_NAME}" "${client_password}" "${state_dir}/clients.json" <<'PY'
+import json, sys
+name, password, output = sys.argv[1:]
+with open(output, "w") as fh:
+    json.dump([{"email": name, "password": password}], fh, indent=2)
+    fh.write("\n")
 PY
-)"
-  cat >"${state_dir}/clients.json" <<EOF
-[
-  {
-    "email": "${CLIENT_NAME}",
-    "id": "${client_uuid}",
-    "flow": "xtls-rprx-vision"
-  }
-]
-EOF
 fi
+chmod 600 "${state_dir}/clients.json"
 
-echo "[4/6] Rendering the Xray config"
+echo "[4/5] Rendering the mihomo config and deploying to the VPS"
 corp_domains_arg="${CONFIG_DIR}/corporate_domains.txt"
 [[ ! -f "${corp_domains_arg}" ]] && corp_domains_arg=""
-python3 - "${CONFIG_DIR}/xray_config.template.json" "${state_dir}/node.json" "${CONFIG_DIR}/ips.txt" "${state_dir}/clients.json" "${tmp_dir}/config.json" "${corp_domains_arg}" <<'PY'
-import ipaddress
-import json
-import sys
-from string import Template
+python3 "${SCRIPT_DIR}/render_mihomo.py" \
+  --template "${CONFIG_DIR}/mihomo_config.template.yaml" \
+  --node "${state_dir}/node.json" \
+  --clients "${state_dir}/clients.json" \
+  --routes "${CONFIG_DIR}/ips.txt" \
+  --corp-domains "${corp_domains_arg}" \
+  --output "${tmp_dir}/config.yaml"
 
-template_path, node_path, routes_path, clients_path, output_path, corp_domains_path = sys.argv[1:]
-template = Template(open(template_path).read())
-node = json.load(open(node_path))
-clients = json.load(open(clients_path))
+# Upload rendered config + cert + key.
+scp "${scp_opts[@]}" \
+  "${tmp_dir}/config.yaml" \
+  "${tmp_dir}/hy2.crt" \
+  "${tmp_dir}/hy2.key" \
+  "${SSH_USER}@${HOST}:${remote_stage}/"
+ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" "chmod 600 $(quote_sh "${remote_stage}/hy2.key")"
 
-ips = []
-for line in open(routes_path):
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#") or not stripped.startswith("route "):
-        continue
-    _, address, mask = stripped.split()
-    network = ipaddress.IPv4Network(f"{address}/{mask}", strict=False)
-    ips.append(str(network))
-
-domains = []
-if corp_domains_path:
-    for line in open(corp_domains_path):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        domains.append(stripped)
-if not domains:
-    domains = ["regexp:^$"]
-
-config = template.substitute(
-    LISTEN_PORT=node["listen_port"],
-    SERVER_NAME=json.dumps(node["server_name"]),
-    REALITY_DEST=json.dumps(node["reality_dest"]),
-    REALITY_PRIVATE_KEY=json.dumps(node["reality_private_key"]),
-    SHORT_ID=json.dumps(node["short_id"]),
-    CLIENTS=json.dumps(clients, indent=6),
-    OUTLINE_ADDRESS=json.dumps(node["outline"]["address"]),
-    OUTLINE_PORT=node["outline"]["port"],
-    OUTLINE_METHOD=json.dumps(node["outline"]["method"]),
-    OUTLINE_PASSWORD=json.dumps(node["outline"]["password"]),
-    CORPORATE_IPS=json.dumps(ips, indent=8),
-    CORPORATE_DOMAINS=json.dumps(domains, indent=8),
-)
-
-parsed = json.loads(config)
-with open(output_path, "w") as handle:
-    json.dump(parsed, handle, indent=2)
-    handle.write("\n")
-PY
-
-echo "[5/6] Uploading the rendered config and starting Xray"
-scp "${scp_opts[@]}" "${tmp_dir}/config.json" "${SSH_USER}@${HOST}:${remote_stage}/config.json"
 ssh "${ssh_opts[@]}" "${SSH_USER}@${HOST}" \
   "sudo $(quote_sh "${remote_stage}/remote_apply_node.sh") deploy-config \
     --install-dir $(quote_sh "${INSTALL_DIR}") \
-    --config $(quote_sh "${remote_stage}/config.json")"
+    --config $(quote_sh "${remote_stage}/config.yaml") \
+    --cert $(quote_sh "${remote_stage}/hy2.crt") \
+    --key $(quote_sh "${remote_stage}/hy2.key")"
 
-echo "[6/6] Fetching the client URI"
-python3 - "${state_dir}/node.json" "${state_dir}/clients.json" "${state_dir}/connection.txt" <<'PY'
-import json
-import sys
-from urllib.parse import urlencode, quote
-
-node = json.load(open(sys.argv[1]))
-clients = json.load(open(sys.argv[2]))
-client = clients[0]
-
-params = urlencode(
-    {
-        "encryption": "none",
-        "flow": client["flow"],
-        "security": "reality",
-        "sni": node["server_name"],
-        "fp": "chrome",
-        "pbk": node["reality_public_key"],
-        "sid": node["short_id"],
-        "type": "tcp",
-        "headerType": "none",
-    }
-)
-
-uri = f"vless://{client['id']}@{node['host']}:{node['listen_port']}?{params}#{quote(client['email'])}"
-with open(sys.argv[3], "w") as handle:
-    handle.write(uri + "\n")
-print(uri)
-PY
+echo "[5/5] Rendering the client mihomo config"
+python3 "${SCRIPT_DIR}/render_mihomo_client.py" \
+  --template "${CONFIG_DIR}/mihomo_client.template.yaml" \
+  --node "${state_dir}/node.json" \
+  --clients "${state_dir}/clients.json" \
+  --name "${CLIENT_NAME}" \
+  --output "${state_dir}/connection.yaml"
+chmod 600 "${state_dir}/connection.yaml"
 
 cat <<EOF
 
 Provisioning finished.
-- Local state: ${state_dir}
-- Client URI: $(cat "${state_dir}/connection.txt")
+- Local state:        ${state_dir}
+- Client config:      ${state_dir}/connection.yaml
+- hy2 fingerprint:    ${hy2_fp}
+
+Hand the client config to the laptop user (it embeds the pinned cert
+fingerprint, host, port, and client password — no separate URI).
 
 Future changes:
 - add/remove clients with ./scripts/manage_inbound.sh

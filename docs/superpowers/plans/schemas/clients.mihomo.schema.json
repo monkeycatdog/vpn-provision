@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TriState mihomo clients",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["email", "password"],
+    "additionalProperties": false,
+    "properties": {
+      "email":    {"type": "string", "minLength": 1},
+      "password": {"type": "string", "minLength": 16}
+    }
+  }
+}

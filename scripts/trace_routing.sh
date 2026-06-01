@@ -12,12 +12,13 @@ Usage:
 
 For each domain prints:
   - resolved IP(s)
-  - predicted exit (corporate / RU / freedom) based on config/ips.txt and .ru TLD heuristic
-  - (unless --no-remote) actual kernel route on the VPS via 'ip route get'
-  - the Xray access-log lines that mention the domain
+  - predicted exit (corporate / RU / freedom) from config/ips.txt + .ru TLD heuristic
+  - (unless --no-remote) lines from the live mihomo /rules dump that mention
+    the domain or its resolved IP
 
-Default path for non-matching destinations is the Freedom Outline outbound,
-so anything not corporate and not obviously RU is predicted as "freedom".
+mihomo's GLOBAL fallback group decides which Outline (or direct-out) handles
+non-corporate, non-RU destinations at runtime; check /proxies/GLOBAL for the
+currently selected outbound (use ./scripts/diagnose_relay.sh).
 EOF
 }
 
@@ -41,7 +42,6 @@ if [[ -z "${STATE_DIR}" || ${#DOMAINS[@]} -eq 0 ]]; then
   usage >&2
   exit 1
 fi
-
 if [[ ! -f "${STATE_DIR}/node.json" ]]; then
   echo "Missing ${STATE_DIR}/node.json" >&2
   exit 1
@@ -76,7 +76,7 @@ for line in open(routes_file):
     except ValueError:
         continue
 
-def classify(ip: str, host: str) -> str:
+def classify(ip, host):
     try:
         addr = ipaddress.IPv4Address(ip)
     except ValueError:
@@ -85,17 +85,16 @@ def classify(ip: str, host: str) -> str:
         if addr in net:
             return "corporate"
     lowered = host.lower().rstrip(".")
-    if lowered.endswith(".ru") or lowered.endswith(".xn--p1ai") or lowered.endswith(".\u0440\u0444"):
+    if lowered.endswith(".ru") or lowered.endswith(".xn--p1ai") or lowered.endswith(".рф"):
         return "direct-ru"
     return "freedom"
 
-out = []
 for d in domains:
     try:
         infos = socket.getaddrinfo(d, None, socket.AF_INET, socket.SOCK_STREAM)
         ips = sorted({i[4][0] for i in infos})
     except socket.gaierror as exc:
-        out.append((d, [], "dns-fail", str(exc)))
+        print(f"{d}\t-\tdns-fail ({exc})")
         continue
     verdicts = {classify(ip, d) for ip in ips}
     if "corporate" in verdicts:
@@ -104,52 +103,57 @@ for d in domains:
         verdict = "direct-ru"
     else:
         verdict = "freedom"
-    out.append((d, ips, verdict, ""))
-
-for d, ips, verdict, err in out:
-    ip_str = ",".join(ips) if ips else "-"
-    note = f" ({err})" if err else ""
-    print(f"{d}\t{ip_str}\t{verdict}{note}")
+    print(f"{d}\t{','.join(ips)}\t{verdict}")
 PY
 }
 
 echo "== Local prediction =="
 printf "%-60s %-44s %s\n" "DOMAIN" "IPs" "PREDICTED"
+local_pred="$(predict "${DOMAINS[@]}")"
 while IFS=$'\t' read -r d ips verdict; do
   printf "%-60s %-44s %s\n" "$d" "$ips" "$verdict"
-done < <(predict "${DOMAINS[@]}")
+done <<< "${local_pred}"
 
 if [[ "${REMOTE}" != "1" ]]; then
   exit 0
 fi
 
 echo ""
-echo "== Remote verification on ${user}@${host} =="
+echo "== Remote rule match on ${user}@${host} (via mihomo /rules) =="
 
-remote_script='set -e
-while IFS= read -r d; do
-  [ -z "$d" ] && continue
-  echo "--- $d ---"
-  ip=$(getent ahostsv4 "$d" | awk "NR==1 {print \$1}")
-  if [ -z "$ip" ]; then
-    echo "  DNS: FAIL"
-    continue
-  fi
-  echo "  DNS: $ip"
-  route_line=$(ip route get "$ip" 2>&1 | head -1)
-  echo "  ROUTE: $route_line"
-  dev=$(echo "$route_line" | awk "{for(i=1;i<=NF;i++) if (\$i==\"dev\") print \$(i+1)}")
-  if [ "$dev" = "tun0" ]; then
-    echo "  EXIT-KERNEL: corporate (tun0)"
-  elif [ -z "$dev" ]; then
-    echo "  EXIT-KERNEL: unresolved"
-  else
-    echo "  EXIT-KERNEL: via $dev (direct if RU / Freedom if default; see Xray access log below)"
-  fi
-  if [ -r /opt/tristate-relay/xray/logs/access.log ]; then
-    echo "  XRAY-LOG:"
-    sudo grep -F "$d" /opt/tristate-relay/xray/logs/access.log 2>/dev/null | tail -3 | sed "s/^/    /" || true
-  fi
-done'
+rules_tmp="$(mktemp -t mihomo-rules.XXXXXX.json)"
+trap 'rm -f "${rules_tmp}"' EXIT
 
-printf '%s\n' "${DOMAINS[@]}" | ssh "${ssh_opts[@]}" "${user}@${host}" "${remote_script}"
+if ! ssh "${ssh_opts[@]}" "${user}@${host}" 'curl -s --max-time 5 http://127.0.0.1:9090/rules' \
+     > "${rules_tmp}" 2>/dev/null || [[ ! -s "${rules_tmp}" ]]; then
+  echo "(could not reach mihomo REST API on 127.0.0.1:9090 via ${user}@${host})"
+  echo "Note: GEOIP/GEOSITE rules require dat files; this dump only resolves literal DOMAIN-* and IP-CIDR rules."
+  exit 0
+fi
+
+# Build a domain -> resolved-IP map from the local prediction (reuse DNS we already did).
+declare -A IP_OF
+while IFS=$'\t' read -r d ips _verdict; do
+  IP_OF["$d"]="${ips%%,*}"
+done <<< "${local_pred}"
+
+for d in "${DOMAINS[@]}"; do
+  echo "--- ${d} ---"
+  ip="${IP_OF[$d]:-}"
+  [[ "${ip}" == "-" ]] && ip=""
+  echo "  DNS: ${ip:-FAIL}"
+  patterns=("${d}")
+  [[ -n "${ip}" ]] && patterns+=("${ip}")
+  hit=0
+  for p in "${patterns[@]}"; do
+    if matches="$(grep -F -- "${p}" "${rules_tmp}" 2>/dev/null)"; then
+      if [[ -n "${matches}" ]]; then
+        printf '%s\n' "${matches}" | sed 's/^/    /'
+        hit=1
+      fi
+    fi
+  done
+  if [[ "${hit}" -eq 0 ]]; then
+    echo "    (no literal DOMAIN-*/IP-CIDR rule mentions this; mihomo will defer to GEOIP/GEOSITE dat lookup)"
+  fi
+done

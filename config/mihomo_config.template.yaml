@@ -1,0 +1,50 @@
+{
+  "mixed-port": 0,
+  "external-controller": "127.0.0.1:9090",
+  "external-controller-cors": {"allow-origins": ["*"]},
+  "log-level": "warning",
+  "geo-auto-update": false,
+  "geodata-mode": true,
+  "geox-url": {
+    "geoip":   "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+    "geosite": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+  },
+  "dns": {
+    "enable": true,
+    "ipv6": false,
+    "listen": "127.0.0.1:1053",
+    "enhanced-mode": "fake-ip",
+    "fake-ip-range": "198.18.0.1/16",
+    "fake-ip-filter": ["*.lan", "localhost.ptlogin2.qq.com", "+.msftncsi.com", "+.msftconnecttest.com"],
+    "default-nameserver": ["1.1.1.1", "8.8.8.8"],
+    "nameserver": ["https://1.1.1.1/dns-query", "https://dns.google/dns-query"],
+    "fallback-filter": {"geoip": true, "geoip-code": "RU"},
+    "fallback": ["https://77.88.8.8/dns-query", "https://77.88.8.1/dns-query"]
+  },
+  "listeners": [
+    {
+      "name": "hy2-in",
+      "type": "hysteria2",
+      "port": $LISTEN_PORT,
+      "listen": "0.0.0.0",
+      "users": $HY2_USERS,
+      "up": 1000,
+      "down": 1000,
+      "alpn": ["h3"],
+      "certificate": "/root/.config/mihomo/cert/server.crt",
+      "private-key": "/root/.config/mihomo/cert/server.key"
+    }
+  ],
+  "proxies": $PROXIES,
+  "proxy-groups": [
+    {
+      "name": "GLOBAL",
+      "type": "fallback",
+      "proxies": $GLOBAL_PROXIES,
+      "url": "http://www.gstatic.com/generate_204",
+      "interval": 60,
+      "lazy": false
+    }
+  ],
+  "rules": $RULES
+}

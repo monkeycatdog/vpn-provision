@@ -1,0 +1,28 @@
+services:
+  mihomo:
+    image: metacubex/mihomo:v1.19.25
+    container_name: mihomo-rig
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]
+    network_mode: host
+    volumes:
+      - ./mihomo:/root/.config/mihomo
+
+  # Corporate egress sidecar. Disabled by default (profile: corp) because it
+  # needs real corp credentials and a reachable gateway. To exercise it:
+  #   1. drop corporate.conf + corporate.auth into ./openvpn-corp/etc/
+  #   2. docker compose --profile corp up -d --build
+  # mihomo (host network) reaches its SOCKS5 at 127.0.0.1:1080.
+  openvpn-corp:
+    build: ../sidecar/openvpn-corp
+    image: tristate-openvpn-corp:local
+    container_name: openvpn-corp-rig
+    profiles: [corp]
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    ports:
+      - "127.0.0.1:1080:1080"
+    volumes:
+      - ./openvpn-corp/etc:/etc/openvpn:ro

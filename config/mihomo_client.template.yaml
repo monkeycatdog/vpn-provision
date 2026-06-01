@@ -1,0 +1,24 @@
+{
+  "mixed-port": 7890,
+  "external-controller": "127.0.0.1:9090",
+  "log-level": "info",
+  "proxies": [
+    {
+      "name": "tristate-hy2",
+      "type": "hysteria2",
+      "server": $SERVER_HOST,
+      "port": $SERVER_PORT,
+      "password": $CLIENT_PASSWORD,
+      "sni": "tristate.local",
+      "skip-cert-verify": true,
+      "fingerprint": $CERT_FINGERPRINT,
+      "alpn": ["h3"],
+      "up": "100 Mbps",
+      "down": "200 Mbps"
+    }
+  ],
+  "proxy-groups": [
+    {"name": "PROXY", "type": "select", "proxies": ["tristate-hy2"]}
+  ],
+  "rules": ["MATCH,PROXY"]
+}

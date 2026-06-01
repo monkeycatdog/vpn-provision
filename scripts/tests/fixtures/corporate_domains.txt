@@ -1,0 +1,2 @@
+corp.example.com
+jira.corp.example.com

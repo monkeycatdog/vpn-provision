@@ -1,0 +1,3 @@
+# corporate static routes (OpenVPN-style)
+route 10.20.0.0 255.255.0.0
+route 172.16.5.0 255.255.255.0

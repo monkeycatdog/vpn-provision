@@ -1,0 +1,24 @@
+{
+  "host": "203.0.113.10",
+  "ssh_user": "ubuntu",
+  "ssh_port": 22,
+  "install_dir": "/opt/tristate",
+  "listen_port": 443,
+  "hysteria2": {
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBASE64\n-----END CERTIFICATE-----\n",
+    "key_pem":  "-----BEGIN PRIVATE KEY-----\nMIIBASE64\n-----END PRIVATE KEY-----\n",
+    "cert_fingerprint_sha256": "AA:BB:CC:DD"
+  },
+  "outline": [
+    {"name":"freedom-eu1","address":"95.164.22.5","port":18066,
+     "method":"chacha20-ietf-poly1305","password":"pw1"},
+    {"name":"freedom-eu2","address":"95.164.22.6","port":18066,
+     "method":"chacha20-ietf-poly1305","password":"pw2"}
+  ],
+  "openvpn_corp": {
+    "server":"vpn.corp.example","port":1194,"proto":"udp",
+    "username":"alice","password":"bobsecret",
+    "ca_pem":"-----BEGIN CERTIFICATE-----\nfakeCA\n-----END CERTIFICATE-----\n",
+    "tls_crypt_pem":"-----BEGIN OpenVPN Static key V1-----\nfake\n-----END OpenVPN Static key V1-----\n"
+  }
+}
