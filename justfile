@@ -9,13 +9,12 @@ provision:
   cd "{{justfile_directory()}}"
   : "${TRISTATE_HOST:?set TRISTATE_HOST in .env}"
   : "${TRISTATE_CORP_OVPN:?set TRISTATE_CORP_OVPN in .env}"
-  : "${TRISTATE_OUTLINE_URI:?set TRISTATE_OUTLINE_URI in .env}"
+  : "${TRISTATE_OUTLINE_URIS:?set TRISTATE_OUTLINE_URIS (comma-separated) in .env}"
   cmd=(
     ./scripts/provision_remote.sh
     --host "$TRISTATE_HOST"
     --user "${TRISTATE_SSH_USER:-root}"
     --corp-ovpn "$TRISTATE_CORP_OVPN"
-    --outline-uri "$TRISTATE_OUTLINE_URI"
     --ssh-port "${TRISTATE_SSH_PORT:-22}"
     --listen-port "${TRISTATE_LISTEN_PORT:-443}"
     --server-name "${TRISTATE_SERVER_NAME:-yandex.ru}"
@@ -24,6 +23,8 @@ provision:
     --install-dir "${TRISTATE_INSTALL_DIR:-/opt/tristate-relay}"
     --state-root "${TRISTATE_STATE_ROOT:-./state}"
   )
+  IFS=',' read -ra _uris <<< "$TRISTATE_OUTLINE_URIS"
+  for u in "${_uris[@]}"; do cmd+=(--outline-uri "$u"); done
   [[ -n "${TRISTATE_SSH_IDENTITY:-}" ]] && cmd+=(--ssh-identity "$TRISTATE_SSH_IDENTITY")
   [[ -n "${TRISTATE_AUTH_FILE:-}" ]] && cmd+=(--auth-file "$TRISTATE_AUTH_FILE")
   "${cmd[@]}"
@@ -34,13 +35,12 @@ provision-check:
   cd "{{justfile_directory()}}"
   : "${TRISTATE_HOST:?set TRISTATE_HOST in .env}"
   : "${TRISTATE_CORP_OVPN:?set TRISTATE_CORP_OVPN in .env}"
-  : "${TRISTATE_OUTLINE_URI:?set TRISTATE_OUTLINE_URI in .env}"
+  : "${TRISTATE_OUTLINE_URIS:?set TRISTATE_OUTLINE_URIS (comma-separated) in .env}"
   cmd=(
     ./scripts/provision_remote.sh
     --host "$TRISTATE_HOST"
     --user "${TRISTATE_SSH_USER:-root}"
     --corp-ovpn "$TRISTATE_CORP_OVPN"
-    --outline-uri "$TRISTATE_OUTLINE_URI"
     --ssh-port "${TRISTATE_SSH_PORT:-22}"
     --listen-port "${TRISTATE_LISTEN_PORT:-443}"
     --server-name "${TRISTATE_SERVER_NAME:-yandex.ru}"
@@ -50,6 +50,8 @@ provision-check:
     --state-root "${TRISTATE_STATE_ROOT:-./state}"
     --dry-run
   )
+  IFS=',' read -ra _uris <<< "$TRISTATE_OUTLINE_URIS"
+  for u in "${_uris[@]}"; do cmd+=(--outline-uri "$u"); done
   [[ -n "${TRISTATE_SSH_IDENTITY:-}" ]] && cmd+=(--ssh-identity "$TRISTATE_SSH_IDENTITY")
   [[ -n "${TRISTATE_AUTH_FILE:-}" ]] && cmd+=(--auth-file "$TRISTATE_AUTH_FILE")
   "${cmd[@]}"

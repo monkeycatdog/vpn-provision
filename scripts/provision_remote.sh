@@ -16,7 +16,8 @@ Usage:
     --host relay.example.com \
     --user root \
     --corp-ovpn /path/to/corporate.ovpn \
-    --outline-uri 'ss://...' \
+    --outline-uri 'ss://...' [--outline-uri 'ssconf://...' ...] \
+    [--outline-uris-csv 'ss://a,ssconf://b'] \
     [--auth-file /path/to/auth.txt] \
     [--ssh-port 22] \
     [--listen-port 443] \
@@ -90,12 +91,118 @@ for raw_line in ovpn_path.read_text().splitlines():
 PY
 }
 
+# parse_outline_uri <uri> <default_name> — prints JSON
+# {"name","address","port","method","password"} for one ss:// or ssconf:// URI.
+parse_outline_uri() {
+  python3 - "$1" "$2" <<'PY'
+import base64
+import json
+import sys
+import urllib.request
+from urllib.parse import urlparse, unquote
+
+
+def parse_flow_scalar(text):
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def parse_simple_yaml(text):
+    # Minimal indent-based block-mapping parser: no lists, no multiline
+    # strings, no anchors. Sufficient for Outline's flat/transport ssconf
+    # response shapes.
+    entries = []
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        stripped = raw.strip()
+        key, sep, val = stripped.partition(":")
+        if not sep:
+            continue
+        entries.append((indent, key.strip(), val.strip()))
+
+    pos = [0]
+
+    def parse_block(indent):
+        node = {}
+        while pos[0] < len(entries):
+            cur_indent, key, val = entries[pos[0]]
+            if cur_indent < indent:
+                break
+            pos[0] += 1
+            if val == "":
+                if pos[0] < len(entries) and entries[pos[0]][0] > cur_indent:
+                    node[key] = parse_block(entries[pos[0]][0])
+                else:
+                    node[key] = None
+            else:
+                node[key] = parse_flow_scalar(val)
+        return node
+
+    return parse_block(0)
+
+
+def extract_ss_fields(body):
+    transport = body.get("transport") if isinstance(body, dict) else None
+    if isinstance(transport, dict):
+        leg = transport.get("tcp") or transport.get("udp")
+        if not isinstance(leg, dict):
+            raise ValueError("transport has no tcp/udp shadowsocks leg")
+        endpoint = leg["endpoint"]
+        host, _, port_str = endpoint.rpartition(":")
+        return host, int(port_str), leg["cipher"], leg["secret"]
+    return body["server"], int(body["server_port"]), body["method"], body["password"]
+
+
+uri = sys.argv[1]
+default_name = sys.argv[2]
+parsed = urlparse(uri)
+
+if parsed.scheme == "ssconf":
+    fetch_url = parsed._replace(scheme="https").geturl()
+    try:
+        with urllib.request.urlopen(fetch_url, timeout=10) as resp:
+            raw_body = resp.read().decode()
+    except Exception as exc:
+        raise SystemExit(f"Failed to fetch ssconf URI {uri!r} ({fetch_url}): {exc}")
+    try:
+        body = json.loads(raw_body)
+    except ValueError:
+        body = parse_simple_yaml(raw_body)
+    try:
+        address, port, method, password = extract_ss_fields(body)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise SystemExit(f"ssconf response from {fetch_url} missing/invalid field: {exc}")
+    name = unquote(parsed.fragment) if parsed.fragment else default_name
+    print(json.dumps({"name": name, "address": address, "port": port, "method": method, "password": password}))
+elif parsed.scheme == "ss":
+    if not parsed.hostname:
+        raise SystemExit("Outline URI must contain a host")
+    creds = parsed.netloc.rsplit("@", 1)[0]
+    try:
+        decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
+    except Exception as exc:
+        raise SystemExit(f"Outline URI userinfo is not valid base64: {exc}")
+    if ":" not in decoded:
+        raise SystemExit("Decoded Outline creds must be METHOD:PASSWORD")
+    method, password = decoded.split(":", 1)
+    port = parsed.port if parsed.port is not None else 8388
+    name = unquote(parsed.fragment) if parsed.fragment else default_name
+    print(json.dumps({"name": name, "address": parsed.hostname, "port": port, "method": method, "password": password}))
+else:
+    raise SystemExit(f"Outline URI must start with ss:// or ssconf:// (got scheme={parsed.scheme!r})")
+PY
+}
+
 HOST=""
 SSH_USER="root"
 SSH_PORT="22"
 CORP_OVPN=""
 AUTH_FILE=""
-OUTLINE_URI=""
+OUTLINE_URIS=()
 LISTEN_PORT="443"
 SERVER_NAME="yandex.ru"
 REALITY_DEST="yandex.ru:443"
@@ -112,7 +219,14 @@ while [[ $# -gt 0 ]]; do
     --ssh-port) SSH_PORT="$2"; shift 2 ;;
     --corp-ovpn) CORP_OVPN="$2"; shift 2 ;;
     --auth-file) AUTH_FILE="$2"; shift 2 ;;
-    --outline-uri) OUTLINE_URI="$2"; shift 2 ;;
+    --outline-uri) OUTLINE_URIS+=("$2"); shift 2 ;;
+    --outline-uris|--outline-uris-csv)
+      IFS=',' read -r -a _csv <<< "$2"
+      for _u in "${_csv[@]}"; do
+        _u="${_u## }"; _u="${_u%% }"
+        [[ -n "${_u}" ]] && OUTLINE_URIS+=("${_u}")
+      done
+      shift 2 ;;
     --listen-port) LISTEN_PORT="$2"; shift 2 ;;
     --server-name) SERVER_NAME="$2"; shift 2 ;;
     --reality-dest) REALITY_DEST="$2"; shift 2 ;;
@@ -126,7 +240,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${HOST}" || -z "${CORP_OVPN}" || -z "${OUTLINE_URI}" ]]; then
+if [[ -z "${HOST}" || -z "${CORP_OVPN}" || ${#OUTLINE_URIS[@]} -eq 0 ]]; then
   usage >&2
   exit 1
 fi
@@ -200,28 +314,27 @@ else
 fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-  echo "[dry-run] Validating Outline URI"
-  python3 - "${OUTLINE_URI}" <<'PY'
-import base64
+  echo "[dry-run] Validating ${#OUTLINE_URIS[@]} Outline URI(s)"
+  dry_outline_entries=()
+  idx=0
+  for uri in "${OUTLINE_URIS[@]}"; do
+    idx=$((idx + 1))
+    entry="$(parse_outline_uri "${uri}" "endpoint-${idx}")"
+    dry_outline_entries+=("${entry}")
+    python3 - "${entry}" <<'PY'
+import json
 import sys
-from urllib.parse import urlparse
-
-uri = sys.argv[1]
-parsed = urlparse(uri)
-if parsed.scheme != "ss":
-    raise SystemExit(f"Outline URI must start with ss:// (got scheme={parsed.scheme!r})")
-if not parsed.hostname:
-    raise SystemExit("Outline URI must contain a host")
-creds = parsed.netloc.rsplit("@", 1)[0]
-try:
-    decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
-except Exception as exc:
-    raise SystemExit(f"Outline URI userinfo is not valid base64: {exc}")
-if ":" not in decoded:
-    raise SystemExit("Decoded Outline creds must be METHOD:PASSWORD")
-method, _ = decoded.split(":", 1)
-op = parsed.port if parsed.port is not None else 8388
-print(f"  scheme=ss host={parsed.hostname} port={op} method={method}")
+e = json.loads(sys.argv[1])
+print(f"  name={e['name']} host={e['address']} port={e['port']} method={e['method']}")
+PY
+  done
+  python3 - "${dry_outline_entries[@]}" <<'PY' >/dev/null
+import json
+import sys
+names = [json.loads(a)["name"] for a in sys.argv[1:]]
+dups = {n for n in names if names.count(n) > 1}
+if dups:
+    raise SystemExit(f"duplicate outline endpoint names: {dups}")
 PY
 
   echo "[dry-run] Enumerating OpenVPN dependencies"
@@ -276,18 +389,10 @@ PY
   "short_id": "0123456789abcdef",
   "reality_private_key": "${dry_private}",
   "reality_public_key":  "${dry_public}",
-  "outline": $(python3 - "${OUTLINE_URI}" <<'PY'
-import base64
+  "outline": $(python3 - "${dry_outline_entries[@]}" <<'PY'
 import json
 import sys
-from urllib.parse import urlparse
-
-parsed = urlparse(sys.argv[1])
-creds = parsed.netloc.rsplit("@", 1)[0]
-decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
-method, password = decoded.split(":", 1)
-op = parsed.port if parsed.port is not None else 8388
-print(json.dumps({"address": parsed.hostname, "port": op, "method": method, "password": password}))
+print(json.dumps([json.loads(a) for a in sys.argv[1:]]))
 PY
 )
 }
@@ -334,10 +439,21 @@ config = template.substitute(
     REALITY_PRIVATE_KEY=json.dumps(node["reality_private_key"]),
     SHORT_ID=json.dumps(node["short_id"]),
     CLIENTS=json.dumps(clients, indent=6),
-    OUTLINE_ADDRESS=json.dumps(node["outline"]["address"]),
-    OUTLINE_PORT=node["outline"]["port"],
-    OUTLINE_METHOD=json.dumps(node["outline"]["method"]),
-    OUTLINE_PASSWORD=json.dumps(node["outline"]["password"]),
+    OUTLINE_OUTBOUNDS=",\n    ".join(
+        json.dumps(
+            {
+                "tag": f"ss-{e['name']}",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [
+                        {"address": e["address"], "port": e["port"], "method": e["method"], "password": e["password"]}
+                    ]
+                },
+            },
+            indent=6,
+        )
+        for e in node["outline"]
+    ),
     CORPORATE_IPS=json.dumps(ips, indent=8),
     CORPORATE_DOMAINS=json.dumps(domains, indent=8),
 )
@@ -388,7 +504,7 @@ Dry run OK. Summary:
   existing state:  ${existing_state}
   ovpn:            ${CORP_OVPN}
   auth file:       ${AUTH_FILE:-<none>}
-  outline:         (validated)
+  outline:         ${#OUTLINE_URIS[@]} endpoint(s) (validated)
   bootstrap client: ${CLIENT_NAME}
 
 No changes were made. Re-run without --dry-run to apply.
@@ -477,24 +593,24 @@ PY
 fi
 
 echo "[3/6] Writing local state to ${state_dir}"
-python3 - "$HOST" "$SSH_USER" "$SSH_PORT" "$INSTALL_DIR" "$LISTEN_PORT" "$SERVER_NAME" "$REALITY_DEST" "$OUTLINE_URI" "$short_id" "${tmp_dir}/bootstrap.json" "${state_dir}/node.json" <<'PY'
-import base64
+outline_entries=()
+idx=0
+for uri in "${OUTLINE_URIS[@]}"; do
+  idx=$((idx + 1))
+  outline_entries+=("$(parse_outline_uri "${uri}" "endpoint-${idx}")")
+done
+python3 - "$HOST" "$SSH_USER" "$SSH_PORT" "$INSTALL_DIR" "$LISTEN_PORT" "$SERVER_NAME" "$REALITY_DEST" "$short_id" "${tmp_dir}/bootstrap.json" "${state_dir}/node.json" "${outline_entries[@]}" <<'PY'
 import json
 import sys
-from urllib.parse import urlparse
 
-host, ssh_user, ssh_port, install_dir, listen_port, server_name, reality_dest, outline_uri, short_id, bootstrap_path, output_path = sys.argv[1:]
+host, ssh_user, ssh_port, install_dir, listen_port, server_name, reality_dest, short_id, bootstrap_path, output_path = sys.argv[1:11]
+outline_entries = [json.loads(e) for e in sys.argv[11:]]
 bootstrap = json.load(open(bootstrap_path))
 
-parsed = urlparse(outline_uri)
-if parsed.scheme != "ss":
-    raise SystemExit("Outline URI must start with ss://")
-
-creds = parsed.netloc.rsplit("@", 1)[0]
-server = parsed.hostname
-port = parsed.port if parsed.port is not None else 8388
-decoded = base64.urlsafe_b64decode(creds + "=" * (-len(creds) % 4)).decode()
-method, password = decoded.split(":", 1)
+names = [e["name"] for e in outline_entries]
+dups = {n for n in names if names.count(n) > 1}
+if dups:
+    raise SystemExit(f"duplicate outline endpoint names: {dups}")
 
 node = {
     "host": host,
@@ -507,12 +623,7 @@ node = {
     "short_id": short_id,
     "reality_private_key": bootstrap["reality_private_key"],
     "reality_public_key": bootstrap["reality_public_key"],
-    "outline": {
-        "address": server,
-        "port": port,
-        "method": method,
-        "password": password,
-    },
+    "outline": outline_entries,
 }
 
 with open(output_path, "w") as handle:
@@ -577,10 +688,21 @@ config = template.substitute(
     REALITY_PRIVATE_KEY=json.dumps(node["reality_private_key"]),
     SHORT_ID=json.dumps(node["short_id"]),
     CLIENTS=json.dumps(clients, indent=6),
-    OUTLINE_ADDRESS=json.dumps(node["outline"]["address"]),
-    OUTLINE_PORT=node["outline"]["port"],
-    OUTLINE_METHOD=json.dumps(node["outline"]["method"]),
-    OUTLINE_PASSWORD=json.dumps(node["outline"]["password"]),
+    OUTLINE_OUTBOUNDS=",\n    ".join(
+        json.dumps(
+            {
+                "tag": f"ss-{e['name']}",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [
+                        {"address": e["address"], "port": e["port"], "method": e["method"], "password": e["password"]}
+                    ]
+                },
+            },
+            indent=6,
+        )
+        for e in node["outline"]
+    ),
     CORPORATE_IPS=json.dumps(ips, indent=8),
     CORPORATE_DOMAINS=json.dumps(domains, indent=8),
 )

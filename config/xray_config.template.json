@@ -75,23 +75,19 @@
       "protocol": "blackhole",
       "settings": {}
     },
-    {
-      "tag": "ss-freedom",
-      "protocol": "shadowsocks",
-      "settings": {
-        "servers": [
-          {
-            "address": $OUTLINE_ADDRESS,
-            "port": $OUTLINE_PORT,
-            "method": $OUTLINE_METHOD,
-            "password": $OUTLINE_PASSWORD
-          }
-        ]
-      }
-    }
+    $OUTLINE_OUTBOUNDS
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
+    "balancers": [
+      {
+        "tag": "ss-balancer",
+        "selector": ["ss-"],
+        "strategy": {
+          "type": "random"
+        }
+      }
+    ],
     "rules": [
       {
         "type": "field",
@@ -178,7 +174,7 @@
           "0.0.0.0/0",
           "::/0"
         ],
-        "outboundTag": "ss-freedom"
+        "balancerTag": "ss-balancer"
       }
     ]
   }
