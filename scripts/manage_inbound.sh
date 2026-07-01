@@ -108,10 +108,21 @@ config = template.substitute(
     REALITY_PRIVATE_KEY=json.dumps(node["reality_private_key"]),
     SHORT_ID=json.dumps(node["short_id"]),
     CLIENTS=json.dumps(clients, indent=6),
-    OUTLINE_ADDRESS=json.dumps(node["outline"]["address"]),
-    OUTLINE_PORT=node["outline"]["port"],
-    OUTLINE_METHOD=json.dumps(node["outline"]["method"]),
-    OUTLINE_PASSWORD=json.dumps(node["outline"]["password"]),
+    OUTLINE_OUTBOUNDS=",\n    ".join(
+        json.dumps(
+            {
+                "tag": f"ss-{e['name']}",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [
+                        {"address": e["address"], "port": e["port"], "method": e["method"], "password": e["password"]}
+                    ]
+                },
+            },
+            indent=6,
+        )
+        for e in node["outline"]
+    ),
     CORPORATE_IPS=json.dumps(ips, indent=8),
     CORPORATE_DOMAINS=json.dumps(domains, indent=8),
 )

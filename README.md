@@ -39,7 +39,7 @@ Before doing anything, confirm each item. Provisioning aborts in preflight if an
 | Passwordless sudo on VPS | `sudo visudo` → `youruser ALL=(ALL) NOPASSWD:ALL` | enforced by preflight |
 | Corporate `.ovpn` | your corp IT | `secrets/corporate.ovpn` → `TRISTATE_CORP_OVPN` |
 | Corporate auth (user/pass, two lines) | your corp IT | `secrets/corporate.auth` → `TRISTATE_AUTH_FILE` |
-| Outline `ss://` URI | Freedom Outline server admin | `TRISTATE_OUTLINE_URI` in `.env` |
+| Outline `ss://`/`ssconf://` URI(s) | Freedom Outline server admin | `TRISTATE_OUTLINE_URIS` in `.env` |
 
 Verify everything from this repo root:
 
@@ -72,11 +72,17 @@ TRISTATE_SSH_PORT=22
 TRISTATE_SSH_IDENTITY=/Users/you/.ssh/id_ed25519
 TRISTATE_CORP_OVPN=./secrets/corporate.ovpn
 TRISTATE_AUTH_FILE=./secrets/corporate.auth
-TRISTATE_OUTLINE_URI=ss://BASE64CREDS@freedom.example:18066/?outline=1
+TRISTATE_OUTLINE_URIS=ss://BASE64CREDS@freedom.example:18066/?outline=1
 TRISTATE_CLIENT_NAME=laptop
 ```
 
 `TRISTATE_CLIENT_NAME=laptop` is what guarantees you get **at least one inbound credential** generated at the end of provisioning (the bootstrap client).
+
+`TRISTATE_OUTLINE_URIS` accepts one or more comma-separated `ss://...` or
+`ssconf://...` (Outline dynamic access key) URIs. `ssconf://` URIs are
+resolved over HTTPS at provision time. Two or more endpoints are load-balanced
+by Xray's routing balancer (`random` strategy) instead of a single fixed
+outbound.
 
 ### Step 2 — Run provisioning
 
@@ -144,7 +150,7 @@ This repository provisions and manages a VPS that accepts a single **VLESS + REA
 |------|-----------|------|
 | Corporate | `direct` in Xray; kernel routes using host routes from OpenVPN on `tun0` | Corporate network via OpenVPN |
 | Russian domestic | `direct`; matches `geoip:ru` and many `geosite:*` / `domain:` rules (see [config/xray_config.template.json](config/xray_config.template.json)), resolved using **Loyalsoldier** [v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) `geoip.dat` / `geosite.dat` on the VPS | VPS native public interface |
-| Everything else | Shadowsocks outbound to the configured Outline node | Freedom Outline relay |
+| Everything else | Shadowsocks outbound(s) to the configured Outline node(s), balanced by Xray's routing balancer when more than one is configured | Freedom Outline relay |
 
 **Control model:** config-as-code. Local scripts under `scripts/` render config, upload assets, and keep state under `state/<host>/`. Run CLI examples from the **repository root** so paths like `./scripts/...` and `config/...` resolve correctly.
 
@@ -209,7 +215,7 @@ Routing order inside Xray matches destinations in this order:
 
 1. Corporate IPs from [config/ips.txt](config/ips.txt) → `direct`
 2. Russian domestic: the `domain` list in the template (including `geosite:…` and `domain:…` entries) and the separate `geoip:ru` rule → `direct`
-3. Everything else → `ss-freedom` (Outline)
+3. Everything else → `ss-balancer` (Outline; balances across `ss-<name>` outbounds, one per configured URI)
 
 Editing [config/xray_config.template.json](config/xray_config.template.json) changes which names match before IP routing; the **`.dat`** files must contain the referenced `geosite:` / `geoip:` tags (Loyalsoldier’s lists include the `category-*-ru` and vendor lists used there).
 
@@ -236,7 +242,7 @@ Editing [config/xray_config.template.json](config/xray_config.template.json) cha
 - A corporate `.ovpn` file
 - Companion files referenced by that `.ovpn` (`ca`, `cert`, `key`, `tls-auth`, `tls-crypt`, or `auth-user-pass` files)
 - Optional two-line auth file if the VPN requires username and password
-- The Outline URI for the Freedom node
+- One or more Outline URI(s) for the Freedom node(s)
 
 **Notes**
 
@@ -281,7 +287,7 @@ Editing [config/xray_config.template.json](config/xray_config.template.json) cha
 | [config/ips.txt](config/ips.txt) | Corporate route list for OpenVPN and Xray corporate matching |
 | [config/corporate_domains.txt](config/corporate_domains.txt) | Corporate-domain match list; rule fires before RU/default, so listed hosts exit via `tun0` even if their IPs change |
 | [justfile](justfile) | Wraps scripts with `just`; loads `.env` via `set dotenv-load` |
-| [.env.example](.env.example) | All `TRISTATE_*` settings (host, SSH, paths, Outline URI, REALITY, state paths) |
+| [.env.example](.env.example) | All `TRISTATE_*` settings (host, SSH, paths, Outline URI(s), REALITY, state paths) |
 | `secrets/` | Placeholder for local OpenVPN credentials (paths you pass to `--corp-ovpn` / `--auth-file`) |
 | `state/<host>/node.json` | Generated node metadata |
 | `state/<host>/clients.json` | Generated client list |
@@ -297,7 +303,7 @@ Editing [config/xray_config.template.json](config/xray_config.template.json) cha
 cp .env.example .env
 ```
 
-2. Set at least `TRISTATE_HOST`, `TRISTATE_CORP_OVPN`, and `TRISTATE_OUTLINE_URI` before `just provision`. See [.env.example](.env.example) for every variable.
+2. Set at least `TRISTATE_HOST`, `TRISTATE_CORP_OVPN`, and `TRISTATE_OUTLINE_URIS` before `just provision`. See [.env.example](.env.example) for every variable.
 
 3. Run recipes from the repository root (`just` loads `.env` next to the [justfile](justfile)):
 
@@ -341,6 +347,20 @@ Basic example:
   --user root \
   --corp-ovpn /path/to/corporate.ovpn \
   --outline-uri 'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpURlBvZzdTT1lZaTZDRjUwNmtnc004@95.164.22.5:18066/?outline=1'
+```
+
+`--outline-uri` is repeatable (or use `--outline-uris-csv 'a,b'`) to configure
+multiple Outline endpoints, balanced by Xray at runtime. Both `ss://` and
+`ssconf://` (Outline dynamic access key, resolved over HTTPS) schemes are
+accepted:
+
+```bash
+./scripts/provision_remote.sh \
+  --host YOUR_VPS_IP \
+  --user root \
+  --corp-ovpn /path/to/corporate.ovpn \
+  --outline-uri 'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpURlBvZzdTT1lZaTZDRjUwNmtnc004@95.164.22.5:18066/?outline=1' \
+  --outline-uri 'ssconf://storage.googleapis.com/bucket/key.yaml'
 ```
 
 With an explicit auth file:
@@ -398,7 +418,8 @@ Important flags:
 - `--ssh-identity`: Optional SSH private key path
 - `--corp-ovpn`: Path to the corporate OpenVPN config
 - `--auth-file`: Optional two-line username/password file
-- `--outline-uri`: Required Outline/Shadowsocks URI
+- `--outline-uri`: Outline/Shadowsocks URI (`ss://` or `ssconf://`); repeatable, at least one required
+- `--outline-uris` / `--outline-uris-csv`: Comma-separated list of the same, as an alternative to repeating `--outline-uri`
 - `--listen-port`: Xray inbound port, default `443`
 - `--server-name`: REALITY SNI value, default `yandex.ru`
 - `--reality-dest`: REALITY destination, default `yandex.ru:443`
@@ -533,12 +554,12 @@ Two recipes cover post-deploy correctness checks.
 
 #### `just diagnose`
 
-Read-only triage of the relay itself. Checks TCP reachability from the VPS to the Outline Shadowsocks endpoint, the Xray container state, and tails the container stderr for recent errors. Use when the client connects but traffic does not flow.
+Read-only triage of the relay itself. Checks TCP reachability from the VPS to each configured Outline Shadowsocks endpoint, the Xray container state, and tails the container stderr for recent errors. Use when the client connects but traffic does not flow.
 
 ```mermaid
 flowchart LR
   L["Laptop"] -- "single SSH" --> V["VPS"]
-  V -- "TCP probe" --> O["Outline :port<br/>(Freedom)"]
+  V -- "TCP probe (each)" --> O["Outline endpoint(s)<br/>(Freedom)"]
   V -- "docker ps" --> X["tristate-xray<br/>container"]
   V -- "docker logs" --> X
   V -. "stdout" .-> L
@@ -570,7 +591,7 @@ flowchart TB
 |---|---|---|
 | Local prediction | Deterministic against `config/ips.txt` + TLD heuristic | Catches missing routes before touching the VPS |
 | `ip route get` on VPS | The Linux kernel's answer | Confirms OpenVPN installed the route and `tun0` is reachable |
-| Xray `access.log` grep | Xray's actual routing decision | The only place that distinguishes `direct` (RU/corp) from `ss-freedom` because both traverse `eth0` |
+| Xray `access.log` grep | Xray's actual routing decision | The only place that distinguishes `direct` (RU/corp) from the `ss-balancer` path because both traverse `eth0` |
 
 **Verdict mapping**
 
@@ -578,7 +599,7 @@ flowchart TB
 |---|---|---|
 | `tun0` | `direct` | Corporate destination, going through the OpenVPN tunnel |
 | `eth0` | `direct` | RU match, exiting on the VPS's native Russian public IP |
-| `eth0` | `ss-freedom` | Default path, tunnelled to the Freedom Outline node |
+| `eth0` | `ss-<endpoint-name>` (via `ss-balancer`) | Default path, tunnelled to one of the Freedom Outline nodes |
 
 **Flags**
 

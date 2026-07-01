@@ -33,14 +33,16 @@ fi
 host="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host"])' "${STATE_DIR}/node.json")"
 user="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_user"])' "${STATE_DIR}/node.json")"
 ssh_port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_port"])' "${STATE_DIR}/node.json")"
-oa="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["outline"]["address"])' "${STATE_DIR}/node.json")"
-op="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["outline"]["port"])' "${STATE_DIR}/node.json")"
-
 ssh_opts=(-p "${ssh_port}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 [[ -n "${SSH_IDENTITY}" ]] && ssh_opts+=(-i "${SSH_IDENTITY}")
 
-echo "=== 1) TCP reachability from VPS to Outline (${oa}:${op}) ==="
-ssh "${ssh_opts[@]}" "${user}@${host}" "timeout 5 bash -c 'echo >/dev/tcp/${oa}/${op}' 2>/dev/null && echo OK || echo FAIL"
+echo "=== 1) TCP reachability from VPS to Outline endpoint(s) ==="
+while IFS=$'\t' read -r on oa op; do
+  echo "-- ${on} (${oa}:${op})"
+  ssh "${ssh_opts[@]}" "${user}@${host}" "timeout 5 bash -c 'echo >/dev/tcp/${oa}/${op}' 2>/dev/null && echo OK || echo FAIL"
+done < <(python3 -c 'import json,sys
+for e in json.load(open(sys.argv[1]))["outline"]:
+    print(f"{e[\"name\"]}\t{e[\"address\"]}\t{e[\"port\"]}")' "${STATE_DIR}/node.json")
 
 echo ""
 echo "=== 2) Docker / Xray container ==="
