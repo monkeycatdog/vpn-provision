@@ -5,3 +5,4 @@ state/
 config/corporate_domains.txt
 config/ips.txt
 !config/*.example
+tmp
